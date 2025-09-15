@@ -7,7 +7,9 @@ app_license = "mit"
 
 # Apps
 # ------------------
-
+doctype_js = {
+    "Work Order": "public/js/work_order_ops_report.js",
+}
 # required_apps = []
 
 # Each item in the list will be shown as an app in the apps page
