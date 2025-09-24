@@ -1,8 +1,8 @@
 # apps/reporting/reporting/api/work_order_ops.py
-# Full server implementation — robust job card submit + punch logs + exports.
+# Full server implementation – robust job card submit + punch logs + exports.
 import nts
 from nts import _
-from nts.utils import flt, get_datetime, now_datetime
+from nts.utils import flt, get_datetime, now_datetime, nowdate, cint
 import uuid
 import traceback
 import io, csv
@@ -160,8 +160,8 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     Report produced/rejected for a Work Order operation.
     - Strict quantity validation
     - Partial punches appended to an unsubmitted Job Card
-    - JC will be submitted only when complete_operation==1 (using framework submit)
-    - If JC submit raises, the full traceback is thrown to UI (so you can see validation/permission error)
+    - JC will be submitted only when complete_operation==1
+    - Properly handles job card submission and work order status updates
     """
     produced_qty = flt(produced_qty or 0)
     process_loss = flt(process_loss or 0)
@@ -268,205 +268,107 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
         nts.throw(_("To complete, produced + rejected must equal pending ({0}).").format(pending_qty))
 
     op_text = op_row.get("operation") or op_row.get("operation_name") or operation_name or ""
+    workstation_val = op_row.get("workstation") or wo.get("workstation") or ""
 
+    # Suppress job card creation notifications
+    nts.flags.mute_messages = True
+    
     # find existing job card candidate (prefer unsubmitted)
     try:
-        jc_candidates = nts.db.sql("select name, docstatus from `tabJob Card` where work_order=%s and operation=%s order by creation desc", (wo.name, op_text))
+        jc_candidates = nts.db.sql("""
+            SELECT name, docstatus 
+            FROM `tabJob Card` 
+            WHERE work_order=%s AND operation=%s AND docstatus=0
+            ORDER BY creation DESC
+        """, (wo.name, op_text))
     except Exception:
         jc_candidates = []
 
     jc_name = None
-    if jc_candidates:
-        for r in jc_candidates:
-            if r and len(r) >= 2 and r[1] == 0:
-                jc_name = r[0]
-                break
-        if not jc_name and jc_candidates:
-            jc_name = jc_candidates[0][0]
-
     jc_doc = None
-    if jc_name:
+    
+    if jc_candidates:
+        jc_name = jc_candidates[0][0]
         try:
             jc_doc = nts.get_doc("Job Card", jc_name)
         except Exception:
             jc_doc = None
 
-    workstation_val = op_row.get("workstation") or wo.get("workstation") or ""
-    jobcard_was_submitted = False
-
-    def compute_minutes(from_time, to_time):
-        try:
-            fd = get_datetime(from_time)
-            td = get_datetime(to_time)
-            diff = (td - fd).total_seconds()
-            return max(0, int(round(diff / 60.0)))
-        except Exception:
-            return 0
-
-    def append_and_submit_jc(jc, emp_docname_local, submit_on_complete=False):
-        """
-        Append a time_log to jc and submit using framework APIs.
-        If submit fails, raise nts.throw with full traceback so UI shows the error.
-        Returns True if JC submitted.
-        """
-        try:
-            # make sure required basics exist
-            if not getattr(jc, "work_order", None):
-                jc.work_order = wo.name
-            if not getattr(jc, "operation", None):
-                jc.operation = op_text
-            if not getattr(jc, "for_quantity", None):
-                jc.for_quantity = required_qty
-            if workstation_val and not getattr(jc, "workstation", None):
-                jc.workstation = workstation_val
-
-            from_time_cand = pick_from_time(idx, wo)
-            to_time_val = posting_dt
-            minutes = compute_minutes(from_time_cand, to_time_val)
-
-            tl = {
-                "employee": emp_docname_local,
-                "from_time": from_time_cand,
-                "to_time": to_time_val,
-                "time_in_mins": minutes,
-                "completed_qty": produced_qty
-            }
+    # Create new job card if none exists or all are submitted
+    if not jc_doc:
+        if workstation_val:
             try:
-                tl["rejected_qty"] = process_loss
-            except Exception:
-                pass
-
-            jc.append("time_logs", tl)
-            # save via framework API
-            jc.flags = getattr(jc, "flags", {}) or {}
-            jc.flags.ignore_permissions = True
-            try:
-                jc.save(ignore_permissions=True)
+                jc_doc = nts.get_doc({
+                    "doctype": "Job Card",
+                    "work_order": wo.name,
+                    "operation": op_text,
+                    "for_quantity": required_qty,
+                    "workstation": workstation_val,
+                    "posting_date": nowdate(),
+                    "company": wo.company,
+                    "project": wo.project if wo.get("project") else None,
+                    "wip_warehouse": wo.wip_warehouse,
+                    "production_item": wo.production_item,
+                    "bom_no": wo.bom_no
+                })
+                jc_doc.flags.ignore_permissions = True
+                jc_doc.insert(ignore_permissions=True)
             except Exception as exc:
+                nts.flags.mute_messages = False
                 tb = traceback.format_exc()
-                nts.log_error(tb, "Job Card save failed")
-                nts.throw(_("Job Card save failed: {0}").format(str(exc) + "\n\n" + tb))
+                nts.log_error(tb, "Job Card creation failed")
+                nts.throw(_("Job Card creation failed: {0}").format(str(exc)))
 
-            # submit using framework, making errors visible
-            if submit_on_complete:
-                try:
-                    if getattr(jc, "docstatus", 0) == 0:
-                        # ensure required fields present again right before submit
-                        if not getattr(jc, "workstation", None) and workstation_val:
-                            jc.workstation = workstation_val
-                        if not getattr(jc, "for_quantity", None):
-                            jc.for_quantity = required_qty
-                        jc.submit()
-                        try:
-                            nts.db.commit()
-                        except Exception:
-                            pass
-                        return True
-                except Exception as exc:
-                    tb = traceback.format_exc()
-                    nts.log_error(tb, "Job Card submit failed")
-                    # raise visible error so you can see exact validation/permission problem
-                    nts.throw(_("Job Card submit failed: {0}").format(str(exc) + "\n\n" + tb))
-            return False
-        except Exception:
-            # re-raise to be handled by caller (we purposely do not swallow)
-            raise
-
-    try:
-        # Create or reuse JC and append time_log (and attempt submit if requested)
-        if jc_doc:
-            if getattr(jc_doc, "docstatus", 0) == 0:
-                jobcard_was_submitted = append_and_submit_jc(jc_doc, emp_docname, submit_on_complete=(int(complete_operation or 0) == 1))
-                jc_name = jc_doc.name
-            else:
-                # most recent JC is submitted, create a new one if workstation available
-                if workstation_val:
-                    try:
-                        orig_msgprint = getattr(nts, "msgprint", None)
-                        try:
-                            nts.msgprint = lambda *a, **k: None
-                            new_jc = nts.get_doc({
-                                "doctype": "Job Card",
-                                "work_order": wo.name,
-                                "operation": op_text,
-                                "for_quantity": required_qty,
-                                "workstation": workstation_val
-                            })
-                            new_jc.insert(ignore_permissions=True)
-                        finally:
-                            if orig_msgprint is not None:
-                                nts.msgprint = orig_msgprint
-                        if new_jc:
-                            jobcard_was_submitted = append_and_submit_jc(new_jc, emp_docname, submit_on_complete=(int(complete_operation or 0) == 1))
-                            jc_name = new_jc.name
-                    except Exception as exc:
-                        tb = traceback.format_exc()
-                        nts.log_error(tb, "New JC creation failed")
-                        nts.throw(_("Job Card creation failed: {0}").format(tb))
-                else:
-                    # no workstation — skip JC creation; totals will be updated below
-                    pass
-        else:
-            if workstation_val:
-                try:
-                    orig_msgprint = getattr(nts, "msgprint", None)
-                    try:
-                        nts.msgprint = lambda *a, **k: None
-                        new_jc = nts.get_doc({
-                            "doctype": "Job Card",
-                            "work_order": wo.name,
-                            "operation": op_text,
-                            "for_quantity": required_qty,
-                            "workstation": workstation_val
-                        })
-                        new_jc.insert(ignore_permissions=True)
-                    finally:
-                        if orig_msgprint is not None:
-                            nts.msgprint = orig_msgprint
-                    if new_jc:
-                        jobcard_was_submitted = append_and_submit_jc(new_jc, emp_docname, submit_on_complete=(int(complete_operation or 0) == 1))
-                        jc_name = new_jc.name
-                except Exception as exc:
-                    tb = traceback.format_exc()
-                    nts.log_error(tb, "Initial JC creation failed")
-                    nts.throw(_("Job Card creation failed: {0}").format(tb))
-            else:
-                # skip JC creation
-                pass
-    except nts.NtsException:
-        # rethrow visible exceptions (we intentionally used nts.throw earlier)
-        raise
-    except Exception:
-        # unexpected bubbled exception
-        tb = traceback.format_exc()
-        nts.log_error(tb, "job card handling failed (unexpected)")
-        nts.throw(_("Unexpected job card error: {0}").format(tb))
+    if jc_doc:
+        from_time_cand = pick_from_time(idx, wo)
+        to_time_val = posting_dt
+        minutes = compute_minutes(from_time_cand, to_time_val)
+        
+        # Add time log entry
+        time_log_entry = {
+            "employee": emp_docname,
+            "from_time": from_time_cand,
+            "to_time": to_time_val,
+            "time_in_mins": minutes,
+            "completed_qty": produced_qty
+        }
+        
+        # Add rejected_qty if field exists
+        if hasattr(jc_doc, 'time_logs') and jc_doc.time_logs and hasattr(jc_doc.time_logs[0], 'rejected_qty'):
+            time_log_entry["rejected_qty"] = process_loss
+        
+        jc_doc.append("time_logs", time_log_entry)
+        
+        # Calculate total quantities from all time logs
+        total_completed = sum([flt(log.completed_qty) for log in jc_doc.time_logs])
+        total_rejected = sum([flt(getattr(log, 'rejected_qty', 0)) for log in jc_doc.time_logs])
+        
+        # Save the job card with updated time logs
+        jc_doc.flags.ignore_permissions = True
+        jc_doc.save(ignore_permissions=True)
+        
+        # Submit the job card if operation is complete
+        if int(complete_operation or 0) == 1:
+            try:
+                # Set the totals before submit
+                jc_doc.total_completed_qty = total_completed
+                if hasattr(jc_doc, 'process_loss_qty'):
+                    jc_doc.process_loss_qty = total_rejected
+                
+                # Submit the job card
+                jc_doc.submit()
+                nts.db.commit()
+                
+            except Exception as exc:
+                nts.flags.mute_messages = False
+                tb = traceback.format_exc()
+                nts.log_error(tb, "Job Card submit failed")
+                nts.throw(_("Job Card submit failed: {0}").format(str(exc)))
 
     # Update operation totals in Work Order Operation
-    final_completed = None
-    final_rejected = None
-    if jobcard_was_submitted:
-        # read authoritative totals from DB (job card submit should have updated via hooks)
-        try:
-            if op_row.get("name"):
-                vals = nts.db.get_value("Work Order Operation", op_row.get("name"), ["completed_qty", "process_loss_qty"], as_dict=True)
-                if vals:
-                    final_completed = flt(vals.get("completed_qty") or 0)
-                    final_rejected = flt(vals.get("process_loss_qty") or 0)
-            else:
-                rows = nts.db.sql("""SELECT completed_qty, process_loss_qty FROM `tabWork Order Operation` WHERE parent=%s AND idx=%s LIMIT 1""", (wo.name, op_row.get("idx") or (idx+1)))
-                if rows and rows[0]:
-                    final_completed = flt(rows[0][0] or 0)
-                    final_rejected = flt(rows[0][1] or 0)
-        except Exception:
-            final_completed = None
-            final_rejected = None
-
-    # If we did not rely on JC submit, add the produced/rejected to current totals
-    if final_completed is None or final_rejected is None:
-        final_completed = current_completed + produced_qty
-        final_rejected = current_rejected + process_loss
-
+    final_completed = current_completed + produced_qty
+    final_rejected = current_rejected + process_loss
+    
     set_vals = {
         "completed_qty": final_completed,
         "process_loss_qty": final_rejected,
@@ -474,6 +376,8 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
         "op_reported_by_user": nts.session.user,
         "op_reported_dt": str(posting_dt)
     }
+    
+    # Add employee name if column exists
     try:
         cols = nts.db.sql("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tabWork Order Operation' AND COLUMN_NAME='op_reported_by_employee_name'")
         if cols:
@@ -488,82 +392,84 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
         if op_row.get("name"):
             nts.db.set_value("Work Order Operation", op_row.get("name"), set_vals, update_modified=False)
         else:
-            nts.db.sql("""UPDATE `tabWork Order Operation`
-                          SET completed_qty=%s, process_loss_qty=%s, op_reported=%s, op_reported_by_user=%s, op_reported_dt=%s
-                          WHERE parent=%s AND idx=%s""",
-                       (set_vals["completed_qty"], set_vals["process_loss_qty"], set_vals["op_reported"], set_vals["op_reported_by_user"], set_vals["op_reported_dt"], wo.name, op_row.get("idx") or (idx+1)))
+            nts.db.sql("""
+                UPDATE `tabWork Order Operation`
+                SET completed_qty=%s, process_loss_qty=%s, op_reported=%s, op_reported_by_user=%s, op_reported_dt=%s
+                WHERE parent=%s AND idx=%s
+            """, (set_vals["completed_qty"], set_vals["process_loss_qty"], set_vals["op_reported"], 
+                  set_vals["op_reported_by_user"], set_vals["op_reported_dt"], wo.name, op_row.get("idx") or (idx+1)))
     except Exception:
         nts.log_error(nts.get_traceback(), "work order operation update failed")
 
-    # Update Work Order.produced_qty from last operation (clamped)
+    # Update Work Order.produced_qty from last operation
     try:
-        rows = nts.db.sql("SELECT completed_qty FROM `tabWork Order Operation` WHERE parent=%s ORDER BY idx DESC LIMIT 1", (wo.name,))
+        rows = nts.db.sql("""
+            SELECT completed_qty 
+            FROM `tabWork Order Operation` 
+            WHERE parent=%s 
+            ORDER BY idx DESC 
+            LIMIT 1
+        """, (wo.name,))
         last_completed = flt(rows[0][0] or 0) if rows else 0.0
         wo_qty = flt(wo.get("qty") or wo.get("production_qty") or 0)
-        produced_to_set = last_completed
-        if wo_qty and produced_to_set > wo_qty:
-            produced_to_set = wo_qty
-        if produced_to_set < 0:
-            produced_to_set = 0.0
-        try:
-            nts.db.set_value("Work Order", wo.name, {"produced_qty": produced_to_set}, update_modified=False)
-        except Exception:
-            try:
-                nts.db.sql("UPDATE `tabWork Order` SET produced_qty=%s WHERE name=%s", (produced_to_set, wo.name))
-            except Exception:
-                nts.log_error(nts.get_traceback(), "Unable to set Work Order.produced_qty")
+        produced_to_set = min(last_completed, wo_qty) if wo_qty else last_completed
+        produced_to_set = max(0.0, produced_to_set)
+        
+        nts.db.set_value("Work Order", wo.name, {"produced_qty": produced_to_set}, update_modified=False)
     except Exception:
         nts.log_error(nts.get_traceback(), "final produced_qty calculation failed")
 
-    # Write punch audit row (best effort)
+    # Write punch audit row
     try:
         _ensure_punch_table()
         row_name = _make_name("OPLOG")
-        nts.db.sql("""INSERT INTO `tabOperation Punch Log` (name, creation, modified, owner, parent_work_order, parent_op_idx, parent_op_name, employee_number, employee_name, produced_qty, rejected_qty, posting_datetime)
-                      VALUES (%s, NOW(), NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                   (row_name, nts.session.user, wo.name, idx, op_text, employee_number, emp_label, produced_qty, process_loss, posting_dt))
+        nts.db.sql("""
+            INSERT INTO `tabOperation Punch Log` 
+            (name, creation, modified, owner, parent_work_order, parent_op_idx, parent_op_name, 
+             employee_number, employee_name, produced_qty, rejected_qty, posting_datetime)
+            VALUES (%s, NOW(), NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (row_name, nts.session.user, wo.name, idx, op_text, employee_number, 
+              emp_label, produced_qty, process_loss, posting_dt))
     except Exception:
         nts.log_error(nts.get_traceback(), "punch log insert failed (non-fatal)")
 
-    # Now: re-load Work Order via framework and save it so ERPNext/your app hooks set status/finish button behavior properly.
+    # Reload and update Work Order status
     try:
         wo_doc = nts.get_doc("Work Order", wo.name)
-        wo_doc.flags = getattr(wo_doc, "flags", {}) or {}
+        
+        # Check if all operations are complete
+        all_complete = all([
+            flt(op.get("completed_qty", 0)) + flt(op.get("process_loss_qty", 0)) >= op_required(op) - 1e-9
+            for op in wo_doc.operations
+        ])
+        
+        # Update status based on completion
+        if all_complete and wo_doc.produced_qty >= wo_doc.qty:
+            wo_doc.status = "Completed"
+        elif wo_doc.produced_qty > 0:
+            wo_doc.status = "In Process"
+        
         wo_doc.flags.ignore_permissions = True
-        try:
-            wo_doc.save(ignore_permissions=True)
-            try:
-                nts.db.commit()
-            except Exception:
-                pass
-        except Exception as exc:
-            tb = traceback.format_exc()
-            nts.log_error(tb, "Work Order save after reporting failed")
-            nts.throw(_("Work Order post-update failed: {0}").format(str(exc) + "\n\n" + tb))
+        wo_doc.save(ignore_permissions=True)
+        nts.db.commit()
     except Exception:
-        nts.log_error(nts.get_traceback(), "Work Order reload after reporting failed")
+        nts.log_error(nts.get_traceback(), "Work Order status update failed")
 
-    # compute remaining for response
+    # Re-enable messages
+    nts.flags.mute_messages = False
+
+    # Compute remaining for response
+    remaining = max(0.0, available_input - (final_completed + final_rejected))
+    
+    return _("Operation {0} reported: produced {1}, rejected {2}. Remaining for this op: {3}").format(
+        op_text, produced_qty, process_loss, remaining)
+
+def compute_minutes(from_time, to_time):
+    """Calculate minutes between two datetime values."""
     try:
-        if op_row.get("name"):
-            vals = nts.db.get_value("Work Order Operation", op_row.get("name"), ["completed_qty", "process_loss_qty"], as_dict=True)
-            if vals:
-                a_completed = flt(vals.get("completed_qty") or 0)
-                a_rejected = flt(vals.get("process_loss_qty") or 0)
-            else:
-                a_completed = final_completed
-                a_rejected = final_rejected
-        else:
-            rows = nts.db.sql("""SELECT completed_qty, process_loss_qty FROM `tabWork Order Operation` WHERE parent=%s AND idx=%s LIMIT 1""", (wo.name, op_row.get("idx") or (idx+1)))
-            if rows and rows[0]:
-                a_completed = flt(rows[0][0] or 0)
-                a_rejected = flt(rows[0][1] or 0)
-            else:
-                a_completed = final_completed
-                a_rejected = final_rejected
-        remaining = max(0.0, available_input - (a_completed + a_rejected))
-        remaining = flt(remaining)
+        fd = get_datetime(from_time)
+        td = get_datetime(to_time)
+        diff = (td - fd).total_seconds()
+        return max(0, int(round(diff / 60.0)))
     except Exception:
-        remaining = 0.0
-
-    return _("Operation {0} reported: produced {1}, rejected {2}. Remaining for this op: {3}").format(op_text, produced_qty, process_loss, remaining)
+        return 0
