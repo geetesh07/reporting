@@ -1,10 +1,10 @@
 # apps/reporting/reporting/api/work_order_ops.py
 # Reporting API for Work Order operations (Job Card friendly).
-# - safe workstation authorization retrieval (prevents "Field not permitted" errors)
-# - job card reuse / creation / submission per punch (one time-log row per punch)
-# - strict downstream quantity validation (prev op produced limits next op)
-# - per-punch audit table (Operation Punch Log)
-# - keeps Work Order produced_qty in sync with op sums (helps Finish flow)
+# - Reuse existing unsubmitted Job Card for partial punches (do NOT submit).
+# - Create a Job Card only if no unsubmitted JC exists and workstation is available.
+# - Submit Job Card automatically only when operation completes (complete_operation==1).
+# - Rejected qty written to Job Card Time Log rejected_qty and Work Order Operation.process_loss_qty.
+# - Strict downstream validation: next op cannot process more than prev op actually produced.
 
 import nts
 from nts import _
@@ -34,7 +34,6 @@ def _ensure_punch_table():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
     except Exception:
-        # best-effort, non-fatal
         pass
 
 def pick_from_time(op_idx, wo_doc):
@@ -70,30 +69,23 @@ def pick_from_time(op_idx, wo_doc):
 
 @nts.whitelist()
 def get_workstation_allowed(workstation):
-    """
-    Safe server helper. Returns comma-separated allowed tokens for a workstation.
-    This avoids client asking the DB for a field that isn't a simple column.
-    """
+    """Return a CSV of allowed tokens for a workstation safely."""
     if not workstation:
         return ""
     allowed_csv = ""
     try:
-        # prefer get_doc (works for child tables and simple fields)
         w = None
         try:
             w = nts.get_doc("Workstation", workstation)
         except Exception:
             w = None
         if w:
-            # field names we've seen in various setups
             for fld in ("authorized_employee_numbers", "authorized_employee_ids", "authorized_employees"):
                 if hasattr(w, fld):
                     val = getattr(w, fld)
-                    # if it's a list/child table, extract sensible tokens
                     if isinstance(val, list):
                         tokens = []
                         for row in val:
-                            # common keys used in such child tables
                             for k in ("employee_number", "employee", "employee_id", "name"):
                                 if row.get(k):
                                     tokens.append(str(row.get(k)))
@@ -101,14 +93,11 @@ def get_workstation_allowed(workstation):
                         if allowed_csv:
                             break
                     else:
-                        # string/CSV
                         if val:
                             allowed_csv = str(val)
                             break
-        # fallback: try db.get_value for simple column if present
         if not allowed_csv:
             try:
-                # this will error if column not permitted - that's why it's in try
                 allowed_csv = nts.db.get_value("Workstation", workstation, "authorized_employee_numbers") or ""
             except Exception:
                 try:
@@ -139,14 +128,6 @@ def get_punch_logs(work_order):
 
 @nts.whitelist()
 def report_operation(work_order, op_index, operation_name, employee_number, produced_qty, process_loss=0, posting_datetime=None, complete_operation=1):
-    """
-    Reports an operation quantity (single punch). Key points:
-    - strict downstream validation (a later op cannot process more than prev op produced)
-    - creates/reuses/submits Job Card properly so FRAPPE hooks run
-    - inserts one time_log row per punch
-    - writes authoritative totals into Work Order Operation and updates Work Order produced_qty
-    - records per-punch audit into Operation Punch Log (SQL)
-    """
     produced_qty = flt(produced_qty or 0)
     process_loss = flt(process_loss or 0)
     if produced_qty <= 0 and process_loss <= 0:
@@ -189,7 +170,7 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
             rq = flt(wo.get("qty") or wo.get("production_qty") or wo.get("for_quantity") or 0)
         return rq
 
-    # find first pending (your rule)
+    # enforce "next pending only"
     first_pending = None
     for i, o in enumerate(operations):
         required = op_required(o)
@@ -205,11 +186,10 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     op_row = operations[idx]
     required_qty = op_required(op_row)
 
-    # ---------------- strict available calculation ----------------
+    # strict available: downstream is limited by previous op completed_qty
     if idx == 0:
         available_input = required_qty
     else:
-        # available is what previous op produced (prev.completed_qty) capped by this op's required
         prev = operations[idx - 1]
         prev_completed = flt(prev.get("completed_qty") or 0)
         try:
@@ -225,7 +205,7 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
             prev_completed = flt(prev.get("completed_qty") or 0)
         available_input = min(required_qty, prev_completed)
 
-    # concurrency safe read of current totals for the op
+    # read current totals for op
     current_completed = 0.0
     current_rejected = 0.0
     try:
@@ -247,7 +227,7 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     if pending_qty < 0:
         pending_qty = 0.0
 
-    # validate incoming punch
+    # validation
     if (produced_qty + process_loss) - 1e-9 > pending_qty:
         nts.throw(_("Produced + Rejected ({0}) exceeds pending ({1}).").format(produced_qty + process_loss, pending_qty))
     if int(complete_operation or 0) == 1 and abs((produced_qty + process_loss) - pending_qty) > 1e-6:
@@ -259,14 +239,26 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     if new_pending < 0:
         new_pending = 0.0
 
-    # ---------------- Job Card handling (create / reuse / submit) ----------------
+    # ---------------- Job Card: REUSE existing UN-SUBMITTED JC (partial) --------------
     op_text = op_row.get("operation") or op_row.get("operation_name") or operation_name or ""
-    # find latest job card for this wo+operation
+
+    # find an unsubmitted job card first
     jc_name = None
     try:
-        rows = nts.db.sql("select name from `tabJob Card` where work_order=%s and operation=%s order by creation desc limit 1", (wo.name, op_text))
+        rows = nts.db.sql("""
+            select name, docstatus from `tabJob Card`
+            where work_order=%s and operation=%s
+            order by creation desc
+        """, (wo.name, op_text))
         if rows:
-            jc_name = rows[0][0]
+            # prefer the most recent docstatus==0 (unsubmitted)
+            for r in rows:
+                if r and isinstance(r, (list, tuple)) and len(r) >= 2 and r[1] == 0:
+                    jc_name = r[0]
+                    break
+            # if no unsubmitted found, take most recent (may be submitted)
+            if not jc_name and rows:
+                jc_name = rows[0][0]
     except Exception:
         jc_name = None
 
@@ -278,67 +270,52 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
             jc_doc = None
 
     workstation_val = op_row.get("workstation") or wo.get("workstation") or ""
-    # if jc exists and is submitted -> create a new JC for this punch (so we can submit it with this punch)
-    # if jc exists and docstatus==0 -> reuse it
-    # if no jc exists -> create one (requires workstation to be present)
-    def _append_time_log_and_submit(jc, employee_link, employee_number_display):
-        """
-        Append a single time_logs row to jc (in-memory), save and submit.
-        We set completed_qty & rejected_qty on the time_log child to the punch qty.
-        """
+
+    def append_time_log_in_jc(jc, emp_docname_local):
+        # append a time_logs child row (use field names robustly)
         try:
-            # append time log
+            tl_values = {
+                "employee": emp_docname_local,
+                "from_time": pick_from_time(idx, wo),
+                "to_time": posting_dt,
+                "time_in_mins": 0,
+                "completed_qty": produced_qty
+            }
+            # include rejected if column exists / field allowed on doc
             try:
-                jc.append("time_logs", {
-                    "employee": employee_link,
-                    "from_time": pick_from_time(idx, wo),
-                    "to_time": posting_dt,
-                    "time_in_mins": max(0, int(round((get_datetime(str(posting_dt)) - get_datetime(str(pick_from_time(idx, wo))).total_seconds() / 60.0))) ) if False else 0,
-                    "completed_qty": produced_qty,
-                    "rejected_qty": process_loss
-                })
+                # try appending rejected_qty key (if child table has field)
+                tl_values["rejected_qty"] = process_loss
             except Exception:
-                # sometimes time_in_mins calculation/fields cause trouble in some forks,
-                # append with minimal payload
-                jc.append("time_logs", {
-                    "employee": employee_link,
-                    "from_time": pick_from_time(idx, wo),
-                    "to_time": posting_dt,
-                    "completed_qty": produced_qty,
-                    "rejected_qty": process_loss
-                })
-            # save and submit (ignore permissions)
+                pass
+            jc.append("time_logs", tl_values)
+            # save but do NOT submit unless the operation completes
             try:
                 jc.save(ignore_permissions=True)
             except Exception:
-                # best-effort: try to log but continue
                 nts.log_error(nts.get_traceback(), "job card save failed")
-            try:
-                # allow ignoring permissions for submit
-                jc.flags = getattr(jc, "flags", {})
-                jc.flags.ignore_permissions = True
-                if getattr(jc, "docstatus", 0) == 0:
-                    jc.submit()
-            except Exception:
-                # if submit fails, log (but we will still update WO operation totals)
-                nts.log_error(nts.get_traceback(), "job card submit failed")
         except Exception:
-            nts.log_error(nts.get_traceback(), "append_time_log_and_submit failed")
+            nts.log_error(nts.get_traceback(), "append_time_log_in_jc failed")
 
-    # Decide action
-    if jc_doc:
-        if getattr(jc_doc, "docstatus", 0) == 0:
-            # reuse: append time log and submit
-            _append_time_log_and_submit(jc_doc, emp_docname, emp_display_number)
-            jc_name = jc_doc.name
-        else:
-            # already submitted -> create a new job card for this punch (requires workstation)
-            if not workstation_val:
-                # cannot create job card; user must provide workstation for job cards
-                # fall back: do not create job card, but continue (we will still record punch audit and update op)
-                jc_name = None
+    created_jc = False
+    try:
+        if jc_doc:
+            # If jc_doc exists and is unsubmitted -> reuse (append time log)
+            if getattr(jc_doc, "docstatus", 0) == 0:
+                append_time_log_in_jc(jc_doc, emp_docname)
+                # only submit if user asked to complete operation
+                if int(complete_operation or 0) == 1:
+                    try:
+                        jc_doc.flags = getattr(jc_doc, "flags", {})
+                        jc_doc.flags.ignore_permissions = True
+                        jc_doc.submit()
+                    except Exception:
+                        # if submit fails, log but continue
+                        nts.log_error(nts.get_traceback(), "job card submit failed (on completion)")
             else:
-                try:
+                # latest JC is submitted. Look for any earlier unsubmitted JC (we tried above)
+                # If none unsubmitted and workstation exists -> create a new JC and append (but do NOT submit unless complete)
+                # If no workstation, skip JC creation (we'll still record op totals & punch audit)
+                if workstation_val:
                     orig_msgprint = getattr(nts, "msgprint", None)
                     try:
                         nts.msgprint = lambda *a, **k: None
@@ -346,28 +323,30 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
                             "doctype": "Job Card",
                             "work_order": wo.name,
                             "operation": op_text,
-                            "for_quantity": produced_qty + process_loss,
+                            "for_quantity": required_qty,
                             "workstation": workstation_val
                         })
                         new_jc.insert(ignore_permissions=True)
+                        created_jc = True
+                        # append but do NOT submit unless completion flag
+                        append_time_log_in_jc(new_jc, emp_docname)
+                        if int(complete_operation or 0) == 1:
+                            try:
+                                new_jc.flags = getattr(new_jc, "flags", {})
+                                new_jc.flags.ignore_permissions = True
+                                new_jc.submit()
+                            except Exception:
+                                nts.log_error(nts.get_traceback(), "job card submit failed (on completion)")
+                        jc_name = new_jc.name
                     finally:
                         if orig_msgprint is not None:
                             nts.msgprint = orig_msgprint
-                    if new_jc:
-                        _append_time_log_and_submit(new_jc, emp_docname, emp_display_number)
-                        jc_name = new_jc.name
-                except Exception:
-                    # if JC creation fails, swallow and continue (we will still update op)
-                    jc_name = None
-    else:
-        # No JC exists; try to create if workstation is present (Job Card requires workstation in many setups)
-        if not workstation_val:
-            # cannot create job card. We don't throw here because you told me to avoid hard failures;
-            # instead we continue and still record punch audit + op totals. But we inform the user.
-            # to strictly enforce, you can replace the next line with nts.throw(...)
-            pass
+                else:
+                    # cannot create JC - skip JC creation, continue
+                    pass
         else:
-            try:
+            # no JC exists at all - create only if workstation present, append and DO NOT submit (unless completion)
+            if workstation_val:
                 orig_msgprint = getattr(nts, "msgprint", None)
                 try:
                     nts.msgprint = lambda *a, **k: None
@@ -375,20 +354,31 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
                         "doctype": "Job Card",
                         "work_order": wo.name,
                         "operation": op_text,
-                        "for_quantity": produced_qty + process_loss,
+                        "for_quantity": required_qty,
                         "workstation": workstation_val
                     })
                     new_jc.insert(ignore_permissions=True)
+                    created_jc = True
+                    append_time_log_in_jc(new_jc, emp_docname)
+                    if int(complete_operation or 0) == 1:
+                        try:
+                            new_jc.flags = getattr(new_jc, "flags", {})
+                            new_jc.flags.ignore_permissions = True
+                            new_jc.submit()
+                        except Exception:
+                            nts.log_error(nts.get_traceback(), "job card submit failed (on completion)")
+                    jc_name = new_jc.name
                 finally:
                     if orig_msgprint is not None:
                         nts.msgprint = orig_msgprint
-                if new_jc:
-                    _append_time_log_and_submit(new_jc, emp_docname, emp_display_number)
-                    jc_name = new_jc.name
-            except Exception:
-                jc_name = None
+            else:
+                # no JC and no workstation -> skip JC creation (we will still update op)
+                pass
+    except Exception:
+        # don't block reporting because JC ops failed; the op totals and punch log are authoritative
+        nts.log_error(nts.get_traceback(), "job card handling failed")
 
-    # ---------------- Update authoritative Work Order Operation totals ----------
+    # ---------------- Update Work Order Operation authoritative totals ----------
     set_vals = {
         "completed_qty": new_completed,
         "process_loss_qty": new_rejected,

@@ -14,9 +14,12 @@ nts.provide("reporting_ops");
       .r-col-narrow{width:160px;white-space:nowrap;text-align:center}
       .r-report-note{color:#666;font-size:0.95em;margin-top:8px}
       .r-rep-header{display:flex;align-items:center;gap:12px;margin-bottom:8px}
-      .r-punch-log{font-size:0.9em;margin-top:6px;padding-left:14px;color:#444}
-      .r-punch-log-item{margin:3px 0;border-left:2px solid #eee;padding-left:8px}
-      .r-punch-small{color:#666;font-size:0.85em}
+      .r-punch-log{font-size:0.92em;margin-top:6px;padding-left:8px;color:#444;background:#fafafa;border-radius:4px;padding:8px}
+      .r-punch-log-item{margin:6px 0;padding:6px;border-left:3px solid #e7e7e7;background:#fff;border-radius:3px}
+      .r-punch-top{display:flex;align-items:center;gap:10px}
+      .r-punch-reporter{font-weight:600}
+      .r-punch-qty{margin-left:auto;font-weight:600}
+      .r-punch-sub{color:#777;font-size:0.85em;margin-top:4px}
     `;
     document.head.appendChild(s);
   }
@@ -45,7 +48,6 @@ nts.provide("reporting_ops");
     if (!ops.length) { frm.fields_dict[HOST_FIELD].html("<div>No operations</div>"); return; }
     const started = !!frm.doc.material_transferred_for_manufacturing;
 
-    // compute first pending op
     let first_pending = null;
     for (let i = 0; i < ops.length; i++) {
       const o = ops[i];
@@ -60,7 +62,6 @@ nts.provide("reporting_ops");
       const reported_at = o.op_reported_dt || "";
       const req = required(o, frm.doc);
       const done = flt_zero(o.completed_qty) + flt_zero(o.process_loss_qty);
-      // pending logic: first op uses required; downstream uses prev.completed_qty
       let pending = 0;
       if (i === 0) {
         pending = Math.max(0, req - done);
@@ -74,7 +75,7 @@ nts.provide("reporting_ops");
       h += `<tr class="r-punch-row" data-idx="${i}"><td colspan="8"><div class="r-punch-log" id="r-punch-log-${i}">Loading punch log...</div></td></tr>`;
     });
     h += `</tbody></table>`;
-    if (!started) h += `<div class="r-report-note">Work Order is not started. Transfer materials to WIP to enable reporting.</div>`; else h += `<div class="r-report-note">Click Report for the next pending operation. Enter produced and rejected. Partial punching supported. Multiple operators allowed — audit records shown below each operation.</div>`;
+    if (!started) h += `<div class="r-report-note">Work Order is not started. Transfer materials to WIP to enable reporting.</div>`; else h += `<div class="r-report-note">Click Report for the next pending operation. Enter produced and rejected. Partial punching supported — multiple reporters shown below each operation.</div>`;
     frm.fields_dict[HOST_FIELD].html(h);
 
     const $wrap = frm.fields_dict[HOST_FIELD].$wrapper;
@@ -97,7 +98,7 @@ nts.provide("reporting_ops");
       }).catch(() => { nts.msgprint("Unable to refresh Work Order. Try again."); });
     });
 
-    // fetch punch logs
+    // fetch punch logs and render in Excel-like compact style
     nts.call({
       method: "reporting.reporting.api.work_order_ops.get_punch_logs",
       args: { work_order: frm.doc.name },
@@ -110,28 +111,29 @@ nts.provide("reporting_ops");
             if (!container) return;
             const items = logs_map[k] || [];
             if (!items.length) {
-              container.innerHTML = `<div class="r-punch-small">No punches yet.</div>`;
+              container.innerHTML = `<div class="r-punch-log"><div class="r-punch-small">No punches yet.</div></div>`;
             } else {
-              let html = "";
+              let html = `<div class="r-punch-log">`;
               items.forEach(it => {
                 const en = escapeHtml(it.employee_number || "");
                 const nm = escapeHtml(it.employee_name || "");
                 const p = parseFloat(it.produced_qty||0);
                 const rej = parseFloat(it.rejected_qty||0);
                 const dt = escapeHtml(it.posting_datetime || "");
-                html += `<div class="r-punch-log-item"><strong>${en}${nm? " - " + nm : ""}</strong> — produced: ${p}, rejected: ${rej}<div class="r-punch-small">${dt}</div></div>`;
+                html += `<div class="r-punch-log-item"><div class="r-punch-top"><div class="r-punch-reporter">${en}${nm? ' - ' + nm : ''}</div><div class="r-punch-qty">produced: ${p} &nbsp; rejected: ${rej}</div></div><div class="r-punch-sub">${dt}</div></div>`;
               });
+              html += `</div>`;
               container.innerHTML = html;
             }
           });
         } catch (e) {
           const placeholders = document.querySelectorAll("[id^='r-punch-log-']");
-          placeholders.forEach(p => { p.innerHTML = `<div class="r-punch-small">Punch log unavailable</div>`; });
+          placeholders.forEach(p => { p.innerHTML = `<div class="r-punch-log"><div class="r-punch-small">Punch log unavailable</div></div>`; });
         }
       },
       error: function() {
         const placeholders = document.querySelectorAll("[id^='r-punch-log-']");
-        placeholders.forEach(p => { p.innerHTML = `<div class="r-punch-small">Punch log unavailable</div>`; });
+        placeholders.forEach(p => { p.innerHTML = `<div class="r-punch-log"><div class="r-punch-small">Punch log unavailable</div></div>`; });
       }
     });
 
@@ -184,7 +186,6 @@ nts.provide("reporting_ops");
 
         const workstation = op.workstation || "";
         if (workstation) {
-          // call server helper to get allowed tokens (safe)
           nts.call({
             method: "reporting.reporting.api.work_order_ops.get_workstation_allowed",
             args: { workstation: workstation },
@@ -194,7 +195,6 @@ nts.provide("reporting_ops");
                 if (raw && String(raw).trim().length) {
                   const arr = String(raw).replace(/;/g, ",").split(",").map(x => x.trim().toLowerCase()).filter(x => x);
                   const empnum = String(values.empno).trim().toLowerCase();
-                  // get employee docname + name if present (best-effort)
                   nts.db.get_value("Employee", {"employee_number": values.empno}, ["name", "employee_name"]).then(r2 => {
                     const empname = (r2 && r2.message && r2.message.employee_name) ? String(r2.message.employee_name).trim().toLowerCase() : "";
                     const empdoc = (r2 && r2.message && r2.message.name) ? String(r2.message.name).trim().toLowerCase() : "";
@@ -202,20 +202,15 @@ nts.provide("reporting_ops");
                     submit_report(frm, op, idx, values, pending, d);
                   }).catch(() => { submit_report(frm, op, idx, values, pending, d); });
                 } else {
-                  // no restriction configured
                   submit_report(frm, op, idx, values, pending, d);
                 }
               } catch (e) {
                 submit_report(frm, op, idx, values, pending, d);
               }
             },
-            error: function() {
-              // if server helper fails, be permissive but log at client
-              submit_report(frm, op, idx, values, pending, d);
-            }
+            error: function() { submit_report(frm, op, idx, values, pending, d); }
           });
         } else {
-          // workstation not set -> allow reporting but server may reject creating Job Card
           submit_report(frm, op, idx, values, pending, d);
         }
       }
