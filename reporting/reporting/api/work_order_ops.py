@@ -1,16 +1,11 @@
 # apps/reporting/reporting/api/work_order_ops.py
-# Reporting API for Work Order operations (Job Card friendly).
-# - Reuse existing unsubmitted Job Card for partial punches (do NOT submit)
-# - Create Job Card only if needed and workstation present (silent)
-# - Submit Job Card only when operation completes (complete_operation==1)
-# - Avoid double-counting: re-read op totals after JC submit if JC submitted
-# - produced_qty on Work Order is set from last operation's completed_qty (clamped to WO qty)
-# - Per-punch audit table: tabOperation Punch Log (created if missing)
-
+# Robust Work Order operation reporting: reliable Job Card submission and stable WO finish workflow.
 import nts
 from nts import _
 from nts.utils import flt, get_datetime, now_datetime
 import uuid
+import csv
+import io
 
 def _make_name(prefix="OPLOG"):
     return "{}-{}".format(prefix, uuid.uuid4().hex[:12])
@@ -35,8 +30,10 @@ def _ensure_punch_table():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
     except Exception:
-        # ignore if cannot create (e.g. insufficient privileges); punch audit will be best-effort
-        pass
+        try:
+            nts.log_error(nts.get_traceback(), "ensure_punch_table failed")
+        except Exception:
+            pass
 
 def pick_from_time(op_idx, wo_doc):
     if op_idx == 0:
@@ -71,7 +68,6 @@ def pick_from_time(op_idx, wo_doc):
 
 @nts.whitelist()
 def get_workstation_allowed(workstation):
-    """Return allowed token CSV for a workstation safely (avoid Field not permitted errors)."""
     if not workstation:
         return ""
     allowed_csv = ""
@@ -82,7 +78,6 @@ def get_workstation_allowed(workstation):
         except Exception:
             w = None
         if w:
-            # prefer structured child table if present
             for fld in ("authorized_employee_numbers", "authorized_employee_ids", "authorized_employees"):
                 if hasattr(w, fld):
                     val = getattr(w, fld)
@@ -113,7 +108,6 @@ def get_workstation_allowed(workstation):
 
 @nts.whitelist()
 def get_punch_logs(work_order):
-    """Return punch logs grouped by operation index for UI rendering."""
     _ensure_punch_table()
     try:
         rows = nts.db.sql("""
@@ -131,14 +125,35 @@ def get_punch_logs(work_order):
         return {}
 
 @nts.whitelist()
-def report_operation(work_order, op_index, operation_name, employee_number, produced_qty, process_loss=0, posting_datetime=None, complete_operation=1):
-    """Report produced/rejected for a work order operation.
+def export_punch_report_csv(work_order):
+    _ensure_punch_table()
+    try:
+        rows = nts.db.sql("""
+            SELECT parent_op_idx AS op_idx, parent_op_name AS operation, employee_number, employee_name, produced_qty, rejected_qty, posting_datetime
+            FROM `tabOperation Punch Log`
+            WHERE parent_work_order=%s
+            ORDER BY parent_op_idx ASC, posting_datetime ASC
+        """, (work_order,), as_dict=True)
+    except Exception:
+        rows = []
+    import io, csv
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["op_idx", "operation", "employee_number", "employee_name", "produced_qty", "rejected_qty", "posting_datetime"])
+    for r in rows:
+        writer.writerow([
+            r.get("op_idx"),
+            r.get("operation"),
+            r.get("employee_number"),
+            r.get("employee_name"),
+            float(r.get("produced_qty") or 0),
+            float(r.get("rejected_qty") or 0),
+            str(r.get("posting_datetime") or "")
+        ])
+    return output.getvalue()
 
-    - produced_qty and process_loss must be numeric.
-    - Validation ensures produced+rejected does not exceed pending for this operation (based on prior op completions).
-    - Partial punches allowed: appended to existing unsubmitted Job Card's time_logs; JC is NOT submitted until complete_operation==1.
-    - If JC submit happens, re-read totals from DB to avoid double-add.
-    """
+@nts.whitelist()
+def report_operation(work_order, op_index, operation_name, employee_number, produced_qty, process_loss=0, posting_datetime=None, complete_operation=1):
     produced_qty = flt(produced_qty or 0)
     process_loss = flt(process_loss or 0)
     if produced_qty <= 0 and process_loss <= 0:
@@ -146,20 +161,18 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
 
     posting_dt = get_datetime(posting_datetime) if posting_datetime else now_datetime()
 
-    # reporter
-    emp_display_number = str(employee_number or "").strip()
-    emp_display_name = ""
     emp_docname = None
+    emp_label = ""
+    emp_number = str(employee_number or "").strip()
     try:
         emp = nts.db.get_value("Employee", {"employee_number": employee_number}, ["name", "employee_name"], as_dict=True)
-        if emp:
-            emp_docname = emp.get("name")
-            emp_display_name = str(emp.get("employee_name") or "")
+        if not emp or not emp.get("name"):
+            nts.throw(_("Employee {0} not found.").format(employee_number))
+        emp_docname = emp.get("name")
+        emp_label = str(emp.get("employee_name") or "")
     except Exception:
-        emp_docname = None
-    reporter_label = emp_display_name or emp_display_number or ""
+        nts.throw(_("Employee {0} not found.").format(employee_number))
 
-    # load work order
     wo = nts.get_doc("Work Order", work_order)
     if wo.docstatus != 1:
         nts.throw(_("Work Order must be submitted."))
@@ -181,7 +194,6 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
             rq = flt(wo.get("qty") or wo.get("production_qty") or wo.get("for_quantity") or 0)
         return rq
 
-    # enforce next-pending rule
     first_pending = None
     for i, o in enumerate(operations):
         required = op_required(o)
@@ -197,7 +209,6 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     op_row = operations[idx]
     required_qty = op_required(op_row)
 
-    # available input is limited by previous operation completed_qty
     if idx == 0:
         available_input = required_qty
     else:
@@ -216,7 +227,6 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
             prev_completed = flt(prev.get("completed_qty") or 0)
         available_input = min(required_qty, prev_completed)
 
-    # read existing op totals
     current_completed = 0.0
     current_rejected = 0.0
     try:
@@ -238,13 +248,11 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     if pending_qty < 0:
         pending_qty = 0.0
 
-    # validation
     if (produced_qty + process_loss) - 1e-9 > pending_qty:
         nts.throw(_("Produced + Rejected ({0}) exceeds pending ({1}).").format(produced_qty + process_loss, pending_qty))
     if int(complete_operation or 0) == 1 and abs((produced_qty + process_loss) - pending_qty) > 1e-6:
         nts.throw(_("To complete, produced + rejected must equal pending ({0}).").format(pending_qty))
 
-    # ---------------- Job Card: reuse unsubmitted or create if necessary (silent) --------------
     op_text = op_row.get("operation") or op_row.get("operation_name") or operation_name or ""
 
     try:
@@ -258,7 +266,7 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
             if r and len(r) >= 2 and r[1] == 0:
                 jc_name = r[0]
                 break
-        if not jc_name:
+        if not jc_name and jc_candidates:
             jc_name = jc_candidates[0][0]
 
     jc_doc = None
@@ -271,31 +279,61 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     workstation_val = op_row.get("workstation") or wo.get("workstation") or ""
     jobcard_was_submitted = False
 
+    def compute_minutes(from_time, to_time):
+        try:
+            fd = get_datetime(from_time)
+            td = get_datetime(to_time)
+            diff = (td - fd).total_seconds()
+            return max(0, int(round(diff / 60.0)))
+        except Exception:
+            return 0
+
     def append_time_log_in_jc(jc, emp_docname_local, submit_on_complete=False):
         submitted = False
         try:
-            tl_values = {
+            from_time_cand = pick_from_time(idx, wo)
+            to_time_val = posting_dt
+            minutes = compute_minutes(from_time_cand, to_time_val)
+            tl = {
                 "employee": emp_docname_local,
-                "from_time": pick_from_time(idx, wo),
-                "to_time": posting_dt,
-                "time_in_mins": 0,
+                "from_time": from_time_cand,
+                "to_time": to_time_val,
+                "time_in_mins": minutes,
                 "completed_qty": produced_qty
             }
             try:
-                tl_values["rejected_qty"] = process_loss
+                tl["rejected_qty"] = process_loss
             except Exception:
                 pass
-            jc.append("time_logs", tl_values)
+
+            jc.append("time_logs", tl)
             try:
                 jc.save(ignore_permissions=True)
             except Exception:
                 nts.log_error(nts.get_traceback(), "job card save failed")
+
             if submit_on_complete:
                 try:
                     jc.flags = getattr(jc, "flags", {})
                     jc.flags.ignore_permissions = True
+                    # ensure required fields present
+                    if not getattr(jc, "workstation", None) and workstation_val:
+                        try:
+                            jc.workstation = workstation_val
+                        except Exception:
+                            pass
+                    if not getattr(jc, "for_quantity", None):
+                        try:
+                            jc.for_quantity = required_qty
+                        except Exception:
+                            pass
                     if getattr(jc, "docstatus", 0) == 0:
                         jc.submit()
+                        # commit to make changes visible immediately in DB and UI
+                        try:
+                            nts.db.commit()
+                        except Exception:
+                            pass
                         submitted = True
                 except Exception:
                     nts.log_error(nts.get_traceback(), "job card submit failed")
@@ -310,6 +348,31 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
                 jc_name = jc_doc.name
             else:
                 if workstation_val:
+                    try:
+                        orig_msgprint = getattr(nts, "msgprint", None)
+                        try:
+                            nts.msgprint = lambda *a, **k: None
+                            new_jc = nts.get_doc({
+                                "doctype": "Job Card",
+                                "work_order": wo.name,
+                                "operation": op_text,
+                                "for_quantity": required_qty,
+                                "workstation": workstation_val
+                            })
+                            new_jc.insert(ignore_permissions=True)
+                        finally:
+                            if orig_msgprint is not None:
+                                nts.msgprint = orig_msgprint
+                        if new_jc:
+                            jobcard_was_submitted = append_time_log_in_jc(new_jc, emp_docname, submit_on_complete=(int(complete_operation or 0) == 1))
+                            jc_name = new_jc.name
+                    except Exception:
+                        nts.log_error(nts.get_traceback(), "new JC creation failed")
+                else:
+                    pass
+        else:
+            if workstation_val:
+                try:
                     orig_msgprint = getattr(nts, "msgprint", None)
                     try:
                         nts.msgprint = lambda *a, **k: None
@@ -327,57 +390,31 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
                     if new_jc:
                         jobcard_was_submitted = append_time_log_in_jc(new_jc, emp_docname, submit_on_complete=(int(complete_operation or 0) == 1))
                         jc_name = new_jc.name
-                else:
-                    # no workstation -> no JC created
-                    pass
-        else:
-            if workstation_val:
-                orig_msgprint = getattr(nts, "msgprint", None)
-                try:
-                    nts.msgprint = lambda *a, **k: None
-                    new_jc = nts.get_doc({
-                        "doctype": "Job Card",
-                        "work_order": wo.name,
-                        "operation": op_text,
-                        "for_quantity": required_qty,
-                        "workstation": workstation_val
-                    })
-                    new_jc.insert(ignore_permissions=True)
-                finally:
-                    if orig_msgprint is not None:
-                        nts.msgprint = orig_msgprint
-                if new_jc:
-                    jobcard_was_submitted = append_time_log_in_jc(new_jc, emp_docname, submit_on_complete=(int(complete_operation or 0) == 1))
-                    jc_name = new_jc.name
+                except Exception:
+                    nts.log_error(nts.get_traceback(), "initial JC creation failed")
             else:
-                # skip JC creation
                 pass
     except Exception:
-        nts.log_error(nts.get_traceback(), "job card handling failed")
+        nts.log_error(nts.get_traceback(), "job card handling outer failed")
 
-    # ---------------- Update Work Order Operation authoritative totals ----------
     final_completed = None
     final_rejected = None
-    try:
-        if jobcard_was_submitted:
-            # re-read updated totals from DB to avoid double-count
-            try:
-                if op_row.get("name"):
-                    vals = nts.db.get_value("Work Order Operation", op_row.get("name"), ["completed_qty", "process_loss_qty"], as_dict=True)
-                    if vals:
-                        final_completed = flt(vals.get("completed_qty") or 0)
-                        final_rejected = flt(vals.get("process_loss_qty") or 0)
-                else:
-                    rows = nts.db.sql("""SELECT completed_qty, process_loss_qty FROM `tabWork Order Operation` WHERE parent=%s AND idx=%s LIMIT 1""", (wo.name, op_row.get("idx") or (idx+1)))
-                    if rows and rows[0]:
-                        final_completed = flt(rows[0][0] or 0)
-                        final_rejected = flt(rows[0][1] or 0)
-            except Exception:
-                final_completed = None
-                final_rejected = None
-    except Exception:
-        final_completed = None
-        final_rejected = None
+
+    if jobcard_was_submitted:
+        try:
+            if op_row.get("name"):
+                vals = nts.db.get_value("Work Order Operation", op_row.get("name"), ["completed_qty", "process_loss_qty"], as_dict=True)
+                if vals:
+                    final_completed = flt(vals.get("completed_qty") or 0)
+                    final_rejected = flt(vals.get("process_loss_qty") or 0)
+            else:
+                rows = nts.db.sql("""SELECT completed_qty, process_loss_qty FROM `tabWork Order Operation` WHERE parent=%s AND idx=%s LIMIT 1""", (wo.name, op_row.get("idx") or (idx+1)))
+                if rows and rows[0]:
+                    final_completed = flt(rows[0][0] or 0)
+                    final_rejected = flt(rows[0][1] or 0)
+        except Exception:
+            final_completed = None
+            final_rejected = None
 
     if final_completed is None or final_rejected is None:
         final_completed = current_completed + produced_qty
@@ -393,7 +430,7 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     try:
         cols = nts.db.sql("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tabWork Order Operation' AND COLUMN_NAME='op_reported_by_employee_name'")
         if cols:
-            rep = reporter_label or ""
+            rep = emp_label or emp_number or ""
             if rep and len(rep) > 200:
                 rep = rep[:200]
             set_vals["op_reported_by_employee_name"] = rep
@@ -411,7 +448,6 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     except Exception:
         nts.log_error(nts.get_traceback(), "work order operation update failed")
 
-    # ---------------- Update Work Order produced_qty from LAST operation (not sum) ----------
     try:
         rows = nts.db.sql("SELECT completed_qty FROM `tabWork Order Operation` WHERE parent=%s ORDER BY idx DESC LIMIT 1", (wo.name,))
         last_completed = flt(rows[0][0] or 0) if rows else 0.0
@@ -431,7 +467,6 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
             except Exception:
                 nts.log_error(nts.get_traceback(), "Unable to set Work Order.produced_qty")
 
-        # set in-progress safely (clamped >= 0) into a typical candidate field
         in_progress_val = 0.0
         try:
             in_progress_val = max(0.0, (wo_qty - produced_to_set) if wo_qty else 0.0)
@@ -467,16 +502,58 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     except Exception:
         nts.log_error(nts.get_traceback(), "final produced_qty/in_progress calculation failed")
 
-    # ---------------- per-punch audit log (non-critical) ----------------
+    try:
+        db_ops = nts.db.sql("""SELECT op_reported, completed_qty, process_loss_qty FROM `tabWork Order Operation` WHERE parent=%s ORDER BY idx ASC""", (wo.name,))
+        all_reported = True
+        any_reported = False
+        for o in db_ops:
+            if not int(o[0] or 0):
+                all_reported = False
+            else:
+                any_reported = True
+        try:
+            if all_reported:
+                if (wo.get("qty") and flt(nts.db.get_value("Work Order", wo.name, "produced_qty") or 0) >= flt(wo.get("qty"))):
+                    nts.db.set_value("Work Order", wo.name, {"status": "Completed"}, update_modified=False)
+                else:
+                    nts.db.set_value("Work Order", wo.name, {"status": "In Process"}, update_modified=False)
+            else:
+                if any_reported:
+                    nts.db.set_value("Work Order", wo.name, {"status": "In Process"}, update_modified=False)
+        except Exception:
+            nts.log_error(nts.get_traceback(), "unable to set work order status")
+    except Exception:
+        nts.log_error(nts.get_traceback(), "unable to compute work order status")
+
     try:
         _ensure_punch_table()
         row_name = _make_name("OPLOG")
         nts.db.sql("""INSERT INTO `tabOperation Punch Log` (name, creation, modified, owner, parent_work_order, parent_op_idx, parent_op_name, employee_number, employee_name, produced_qty, rejected_qty, posting_datetime)
                       VALUES (%s, NOW(), NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                   (row_name, nts.session.user, wo.name, idx, op_text, emp_display_number, emp_display_name, produced_qty, process_loss, posting_dt))
+                   (row_name, nts.session.user, wo.name, idx, op_text, emp_number, emp_label, produced_qty, process_loss, posting_dt))
     except Exception:
         nts.log_error(nts.get_traceback(), "punch log insert failed (non-fatal)")
 
-    remaining = max(0.0, available_input - (final_completed + final_rejected))
-    remaining = flt(remaining)
+    try:
+        if op_row.get("name"):
+            vals = nts.db.get_value("Work Order Operation", op_row.get("name"), ["completed_qty", "process_loss_qty"], as_dict=True)
+            if vals:
+                a_completed = flt(vals.get("completed_qty") or 0)
+                a_rejected = flt(vals.get("process_loss_qty") or 0)
+            else:
+                a_completed = final_completed
+                a_rejected = final_rejected
+        else:
+            rows = nts.db.sql("""SELECT completed_qty, process_loss_qty FROM `tabWork Order Operation` WHERE parent=%s AND idx=%s LIMIT 1""", (wo.name, op_row.get("idx") or (idx+1)))
+            if rows and rows[0]:
+                a_completed = flt(rows[0][0] or 0)
+                a_rejected = flt(rows[0][1] or 0)
+            else:
+                a_completed = final_completed
+                a_rejected = final_rejected
+        remaining = max(0.0, available_input - (a_completed + a_rejected))
+        remaining = flt(remaining)
+    except Exception:
+        remaining = 0.0
+
     return _("Operation {0} reported: produced {1}, rejected {2}. Remaining for this op: {3}").format(op_text, produced_qty, process_loss, remaining)
