@@ -46,11 +46,14 @@ nts.provide("reporting_ops");
     ops.forEach((o, i) => {
       const reporter_name = o.op_reported_by_employee_name || "";
       const reported_at = o.op_reported_dt || "";
-      const show_btn = started && first_pending === i && !o.op_reported;
-      h += `<tr data-idx="${i}"><td>${o.idx || i+1}</td><td>${escapeHtml(o.operation||"")}</td><td class="r-col-center">${o.completed_qty||0}</td><td class="r-col-center">${o.process_loss_qty||0}</td><td>${escapeHtml(o.workstation||"")}</td><td class="r-col-center reporter-cell" data-emp="${escapeHtml(o.op_reported_by_employee||"")}">${escapeHtml(reporter_name||"") || "—"}</td><td class="r-col-center">${escapeHtml(reported_at||"") || "—"}</td><td class="r-col-center">${show_btn?`<button class="r-report-btn" data-idx="${i}">Report</button>`:"—"}</td></tr>`;
+      const req = required(o, frm.doc);
+      const done = flt_zero(o.completed_qty) + flt_zero(o.process_loss_qty);
+      const pending = Math.max(0, req - done);
+      const show_btn = started && first_pending === i && !o.op_reported && pending > 0;
+      h += `<tr data-idx="${i}"><td>${o.idx || i+1}</td><td>${escapeHtml(o.operation||"")}</td><td class="r-col-center">${o.completed_qty||0}</td><td class="r-col-center">${o.process_loss_qty||0}</td><td>${escapeHtml(o.workstation||"")}</td><td class="r-col-center reporter-cell" data-emp="${escapeHtml(o.op_reported_by_employee||"")}">${escapeHtml(reporter_name||"") || "—"}</td><td class="r-col-center">${escapeHtml(reported_at||"") || "—"}</td><td class="r-col-center">${show_btn?`<button class="r-report-btn" data-idx="${i}">Report (${pending} left)</button>`:"—"}</td></tr>`;
     });
     h += `</tbody></table>`;
-    if (!started) h += `<div class="r-report-note">Work Order is not started. Transfer materials to WIP to enable reporting.</div>`; else h += `<div class="r-report-note">Click Report for the next pending operation. Enter produced and rejected. Produced may be 0 when everything is rejected.</div>`;
+    if (!started) h += `<div class="r-report-note">Work Order is not started. Transfer materials to WIP to enable reporting.</div>`; else h += `<div class="r-report-note">Click Report for the next pending operation. Enter produced and rejected. Produced may be 0 when everything is rejected. Partial punching supported.</div>`;
     frm.fields_dict[HOST_FIELD].html(h);
     const $wrap = frm.fields_dict[HOST_FIELD].$wrapper;
     $wrap.find(".r-report-btn").off("click").on("click", function() {
@@ -95,7 +98,8 @@ nts.provide("reporting_ops");
         {label: "Employee Number", fieldname: "empno", fieldtype: "Data", reqd: 1},
         {label: "Employee Name", fieldname: "empname", fieldtype: "Data", read_only: 1},
         {label: "Produced", fieldname: "prod", fieldtype: "Float", default: pending},
-        {label: "Rejected", fieldname: "rej", fieldtype: "Float", default: 0}
+        {label: "Rejected", fieldname: "rej", fieldtype: "Float", default: 0},
+        {label: "Complete Operation", fieldname: "complete", fieldtype: "Check", description: "Check only when produced+rejected equals remaining pending"}
       ],
       primary_action_label: "Submit",
       primary_action: function(values) {
@@ -104,8 +108,10 @@ nts.provide("reporting_ops");
         const rej = flt_zero(values.rej);
         if (produced <= 0 && rej <= 0) { nts.msgprint("Enter produced or rejected quantity."); return; }
         if (produced + rej > pending + 1e-9) { nts.msgprint("Produced + Rejected exceeds pending."); return; }
+        if (values.complete && Math.abs((produced + rej) - pending) > 1e-6) { nts.msgprint("To mark complete, produced+rejected must equal remaining pending."); return; }
         const workstation = op.workstation || "";
         if (workstation) {
+          // client-side workstation auth check - best-effort; if Workstation fields missing the promise will reject and we submit anyway
           nts.db.get_value("Workstation", workstation, ["authorized_employee_numbers", "authorized_employee_ids"]).then(res => {
             const raw = (res && res.message) ? (res.message.authorized_employee_numbers || res.message.authorized_employee_ids || "") : "";
             if (raw && String(raw).trim().length) {
@@ -149,7 +155,7 @@ nts.provide("reporting_ops");
         produced_qty: produced,
         process_loss: rej,
         posting_datetime: nts.datetime.now_datetime(),
-        complete_operation: Math.abs((produced + rej) - pending) < 1e-6 ? 1 : 0
+        complete_operation: values.complete ? 1 : 0
       },
       freeze: true,
       freeze_message: "Reporting...",
