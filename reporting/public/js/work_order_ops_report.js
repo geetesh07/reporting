@@ -1,7 +1,4 @@
 // apps/reporting/reporting/public/js/work_order_ops_report.js
-// Renders operations table with merged operation-name cell and per-punch rows beneath.
-// Reporter column enlarged; shows only employee_name (truncated) or employee_number if name missing.
-
 nts.provide("reporting_ops");
 (function() {
   if (!document.getElementById("reporting-custom-css")) {
@@ -14,18 +11,16 @@ nts.provide("reporting_ops");
       .r-report-btn{padding:6px 12px;background:#007bff;color:#fff;border-radius:6px;border:0;cursor:pointer;font-size:13px}
       .r-small-muted{color:#777;font-size:0.95em}
       .r-col-center{text-align:center}
-      /* tuned widths */
       .r-col-num{width:46px}
       .r-col-op{width:260px}
       .r-col-com{width:86px}
       .r-col-rej{width:86px}
       .r-col-ws{width:120px}
-      .r-col-rep{width:240px} /* reporter column larger */
+      .r-col-rep{width:240px}
       .r-col-date{width:150px}
       .r-reporter-cell{font-weight:600}
       .r-empty-cell{background:#fafafa}
       .r-punch-log-item{font-size:0.92em;color:#444;padding:6px 0}
-      .r-punch-sub{color:#666;font-size:0.85em;margin-top:4px}
       .r-report-note{color:#666;font-size:0.95em;margin-top:8px}
     `;
     document.head.appendChild(s);
@@ -61,7 +56,6 @@ nts.provide("reporting_ops");
     const ops = frm.doc.operations || [];
     const started = !!frm.doc.material_transferred_for_manufacturing;
 
-    // compute first pending op
     let first_pending = null;
     for (let i = 0; i < ops.length; i++) {
       const o = ops[i];
@@ -84,7 +78,7 @@ nts.provide("reporting_ops");
     ops.forEach((o, idx) => {
       const req = required(o, frm.doc);
       const done = flt_zero(o.completed_qty) + flt_zero(o.process_loss_qty);
-      let pending = 0;
+      let pending;
       if (idx === 0) pending = Math.max(0, req - done);
       else {
         const prev = (frm.doc.operations || [])[idx - 1] || {};
@@ -92,10 +86,8 @@ nts.provide("reporting_ops");
         pending = Math.max(0, prev_completed - done);
       }
       const show_btn = started && first_pending === idx && !o.op_reported && pending > 0;
-
       const punches = logs_map[idx] || [];
 
-      // main row with operation name (rowspan punches_count + 1)
       h += `<tr data-idx="${idx}">`;
       h += `<td class="r-col-num" rowspan="${punches.length + 1}">${o.idx || idx+1}</td>`;
       h += `<td class="r-col-op" rowspan="${punches.length + 1}">${escapeHtml(o.operation || "")}</td>`;
@@ -109,7 +101,6 @@ nts.provide("reporting_ops");
       h += `<td class="r-col-date">${show_btn?`<button class="r-report-btn" data-idx="${idx}">Report (${pending} left)</button>`:"—"}</td>`;
       h += `</tr>`;
 
-      // punch rows (one per punch)
       if (punches.length) {
         punches.forEach(function(p) {
           const name_only = (p.employee_name && p.employee_name.trim()) ? p.employee_name.trim() : (p.employee_number || "");
@@ -136,11 +127,10 @@ nts.provide("reporting_ops");
     });
 
     h += `</tbody></table>`;
-    h += `<div class="r-report-note">Click Report for the next pending operation. Produced may be 0 when everything is rejected. Partial punching supported. Multiple operators shown as separate rows under each operation.</div>`;
+    h += `<div class="r-report-note">Click Report for the next pending operation. Produced may be 0 when everything is rejected. Partial punching supported.</div>`;
 
     frm.fields_dict[HOST_FIELD].html(h);
 
-    // attach actions
     const $wrap = frm.fields_dict[HOST_FIELD].$wrapper;
     $wrap.find(".r-report-btn").off("click").on("click", function() {
       const idx = parseInt(this.getAttribute("data-idx"), 10);
