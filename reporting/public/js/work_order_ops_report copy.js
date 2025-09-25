@@ -1,5 +1,6 @@
 // apps/reporting/reporting/public/js/work_order_ops_report.js
-// Safe UI that calls server and only updates after confirmed success.
+// Updated: bypass workstation auth in UI, update table live using server structured response
+
 nts.provide("reporting_ops");
 (function() {
   if (!document.getElementById("reporting-custom-css")) {
@@ -172,8 +173,7 @@ nts.provide("reporting_ops");
         {label: "Employee Name", fieldname: "empname", fieldtype: "Data", read_only: 1},
         {label: "Produced", fieldname: "prod", fieldtype: "Float", default: pending},
         {label: "Rejected", fieldname: "rej", fieldtype: "Float", default: 0},
-        {label: "Complete Operation", fieldname: "complete", fieldtype: "Check", description: "Check only when produced+rejected equals remaining pending"},
-        {label: "Force Complete JC (admin)", fieldname: "force", fieldtype: "Check", description: "Force-complete Job Card (bypass validations)."}
+        {label: "Complete Operation", fieldname: "complete", fieldtype: "Check", description: "Check only when produced+rejected equals remaining pending"}
       ],
       primary_action_label: "Submit",
       primary_action: function(values) {
@@ -184,6 +184,7 @@ nts.provide("reporting_ops");
         if (produced + rej > pending + 1e-9) { nts.msgprint("Produced + Rejected exceeds pending."); return; }
         if (values.complete && Math.abs((produced + rej) - pending) > 1e-6) { nts.msgprint("To mark complete, produced+rejected must equal remaining pending."); return; }
 
+        // Bypass workstation authorization check per user's request: directly call server
         submit_report(frm, op, idx, values, pending, d);
       }
     });
@@ -213,8 +214,7 @@ nts.provide("reporting_ops");
         produced_qty: produced,
         process_loss: rej,
         posting_datetime: nts.datetime.now_datetime(),
-        complete_operation: values.complete ? 1 : 0,
-        force_complete: values.force ? 1 : 1   // default force to 1 to match server heavy-handed approach
+        complete_operation: values.complete ? 1 : 0
       },
       freeze: true,
       freeze_message: "Reporting...",
@@ -222,27 +222,46 @@ nts.provide("reporting_ops");
         try {
           const resp = r && r.message ? r.message : (r || {});
           if (resp.ok) {
+            // Update UI: insert a punch row under the operation and update completed/reported columns
+            const wrapper = frm.fields_dict[HOST_FIELD].$wrapper;
+            // Insert a new row representing this punch (live update)
+            const opRows = wrapper.find(`tr[data-idx="${idx}"]`);
+            // Build punch row HTML
+            const reporter = resp.reporter_name || (values.empname || values.empno);
+            const dt = resp.posting_datetime || nts.datetime.now_datetime();
+            const punchHtml = `<tr class="r-punch-row live-punch-${resp.job_card}">
+              <td class="r-col-com">${resp.produced_qty}</td>
+              <td class="r-col-rej">${resp.rejected_qty}</td>
+              <td class="r-col-ws r-empty-cell"></td>
+              <td class="r-reporter-cell">${escapeHtml(reporter)}</td>
+              <td class="r-col-date">${escapeHtml(dt)}</td>
+              <td class="r-col-date">—</td>
+            </tr>`;
+            // find position to append: after the op row block (closest table)
+            const tbody = wrapper.find("table.r-report-table tbody");
+            // We will insert after the op row we found
+            if (opRows && opRows.length) {
+              // find the last row of this operation group
+              let insertAfter = opRows.eq(0);
+              // walk forward to find the last row belonging to this operation (skip punch rows)
+              let cur = insertAfter.next();
+              while (cur && cur.length && !cur.attr("data-idx")) {
+                insertAfter = cur;
+                cur = insertAfter.next();
+              }
+              insertAfter.after(punchHtml);
+            } else {
+              tbody.append(punchHtml);
+            }
+
+            // Update the operation's completed/rejected cells and reporter/time columns
+            // Simplest: refresh doc on background to ensure values are authoritative
             dialog.hide();
-            nts.msgprint(resp.message || "Reported.");
-            // refresh authoritative doc values to avoid doubling / ghost rows
             frm.reload_doc();
+            nts.msgprint(resp.message || "Reported.");
           } else {
             dialog.hide();
-            const err = resp.error_message || "Reporting failed.";
-            const tb = resp.traceback;
-            if (tb) {
-              const d = new nts.ui.Dialog({
-                title: "Server Error",
-                fields: [{label:"Error", fieldname:"err", fieldtype:"Small Text", read_only:1},{label:"Trace", fieldname:"tb", fieldtype:"Code", read_only:1}],
-                primary_action_label: "Close",
-                primary_action: function(){ d.hide(); }
-              });
-              d.set_value("err", err);
-              d.set_value("tb", tb);
-              d.show();
-            } else {
-              nts.msgprint(err);
-            }
+            nts.msgprint("Reporting failed: " + (resp.message || "Unknown"));
             frm.reload_doc();
           }
         } catch (e) {
@@ -252,13 +271,13 @@ nts.provide("reporting_ops");
         }
       },
       error: function(err) {
-        dialog.hide();
         try {
           const srv = err && err.responseJSON && err.responseJSON._server_messages ? JSON.parse(err.responseJSON._server_messages)[0] : (err && err.responseJSON && err.responseJSON.message ? err.responseJSON.message : null);
           if (srv) { nts.msgprint(String(srv)); } else { nts.msgprint("Failed to report. Contact admin."); }
         } catch (e) {
           nts.msgprint("Failed to report. Contact admin.");
         }
+        dialog.hide();
         frm.reload_doc();
       }
     });
