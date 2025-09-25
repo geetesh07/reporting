@@ -1,5 +1,5 @@
 // apps/reporting/reporting/public/js/work_order_ops_report.js
-// Safe UI that calls server and only updates after confirmed success.
+// Fixed UI for proper partial punching support
 nts.provide("reporting_ops");
 (function() {
   if (!document.getElementById("reporting-custom-css")) {
@@ -20,9 +20,11 @@ nts.provide("reporting_ops");
       .r-col-rep{width:240px}
       .r-col-date{width:150px}
       .r-reporter-cell{font-weight:600}
-      .r-empty-cell{background:#fafafa'}
+      .r-empty-cell{background:#fafafa}
       .r-punch-log-item{font-size:0.92em;color:#444;padding:6px 0}
       .r-report-note{color:#666;font-size:0.95em;margin-top:8px}
+      .r-operation-completed{background-color:#e8f5e8;}
+      .r-operation-partial{background-color:#fff3cd;}
     `;
     document.head.appendChild(s);
   }
@@ -57,12 +59,27 @@ nts.provide("reporting_ops");
     const ops = frm.doc.operations || [];
     const started = !!frm.doc.material_transferred_for_manufacturing;
 
+    // Find first operation with remaining quantity (not necessarily the first non-reported one)
     let first_pending = null;
     for (let i = 0; i < ops.length; i++) {
       const o = ops[i];
       const req = required(o, frm.doc);
       const done = flt_zero(o.completed_qty) + flt_zero(o.process_loss_qty);
-      if (!o.op_reported && done < req - 1e-9) { first_pending = i; break; }
+      
+      // Check if this operation has remaining quantity
+      let pending;
+      if (i === 0) {
+        pending = Math.max(0, req - done);
+      } else {
+        const prev = ops[i - 1] || {};
+        const prev_completed = flt_zero(prev.completed_qty);
+        pending = Math.max(0, prev_completed - done);
+      }
+      
+      if (pending > 1e-9) { 
+        first_pending = i; 
+        break; 
+      }
     }
 
     let h = `<table class="r-report-table"><thead><tr>
@@ -80,16 +97,20 @@ nts.provide("reporting_ops");
       const req = required(o, frm.doc);
       const done = flt_zero(o.completed_qty) + flt_zero(o.process_loss_qty);
       let pending;
-      if (idx === 0) pending = Math.max(0, req - done);
-      else {
+      if (idx === 0) {
+        pending = Math.max(0, req - done);
+      } else {
         const prev = (frm.doc.operations || [])[idx - 1] || {};
         const prev_completed = flt_zero(prev.completed_qty);
         pending = Math.max(0, prev_completed - done);
       }
-      const show_btn = started && first_pending === idx && !o.op_reported && pending > 0;
+      
+      const show_btn = started && first_pending === idx && pending > 1e-9;
       const punches = logs_map[idx] || [];
+      const is_completed = o.op_reported || (pending <= 1e-9);
+      const row_class = is_completed ? "r-operation-completed" : (done > 1e-9 ? "r-operation-partial" : "");
 
-      h += `<tr data-idx="${idx}">`;
+      h += `<tr data-idx="${idx}" class="${row_class}">`;
       h += `<td class="r-col-num" rowspan="${Math.max(1, punches.length) + 1}">${o.idx || idx+1}</td>`;
       h += `<td class="r-col-op" rowspan="${Math.max(1, punches.length) + 1}">${escapeHtml(o.operation || "")}</td>`;
       h += `<td class="r-col-com">${o.completed_qty || 0}</td>`;
@@ -99,7 +120,7 @@ nts.provide("reporting_ops");
       const rep_display = rep_summary.length > 28 ? escapeHtml(rep_summary.substring(0, 25) + "...") : escapeHtml(rep_summary || "—");
       h += `<td class="r-reporter-cell">${rep_display}</td>`;
       h += `<td class="r-col-date">${escapeHtml(o.op_reported_dt || "—")}</td>`;
-      h += `<td class="r-col-date">${show_btn?`<button class="r-report-btn" data-idx="${idx}">Report (${pending} left)</button>`:"—"}</td>`;
+      h += `<td class="r-col-date">${show_btn?`<button class="r-report-btn" data-idx="${idx}">Report (${pending.toFixed(1)} left)</button>`:"—"}</td>`;
       h += `</tr>`;
 
       if (punches.length) {
@@ -128,7 +149,7 @@ nts.provide("reporting_ops");
     });
 
     h += `</tbody></table>`;
-    h += `<div class="r-report-note">Click Report for the next pending operation. Produced may be 0 when everything is rejected. Partial punching supported. Workstation auth check disabled for quick reporting.</div>`;
+    h += `<div class="r-report-note">Click Report for operations with remaining quantities. Partial punching supported - operation stays open until explicitly completed. Green rows are completed operations, yellow rows have partial progress.</div>`;
 
     frm.fields_dict[HOST_FIELD].html(h);
 
@@ -138,15 +159,6 @@ nts.provide("reporting_ops");
       // reload doc lightly then show dialog
       frm.reload_doc().then(() => {
         const fresh = cur_frm.doc.operations || [];
-        let fp = null;
-        for (let i = 0; i < fresh.length; i++) {
-          const o = fresh[i];
-          const req = required(o, cur_frm.doc);
-          const done = flt_zero(o.completed_qty) + flt_zero(o.process_loss_qty);
-          if (!o.op_reported && done < req - 1e-9) { fp = i; break; }
-        }
-        if (fp === null) { nts.msgprint("All operations already reported."); frm.reload_doc(); return; }
-        if (fp !== idx) { nts.msgprint("This operation is no longer the next pending operation. UI refreshed."); frm.reload_doc(); return; }
         const op = fresh[idx];
         if (!op) { nts.msgprint("Operation not found."); frm.reload_doc(); return; }
         open_dialog(frm, op, idx);
@@ -158,8 +170,9 @@ nts.provide("reporting_ops");
     const req = required(op, frm.doc);
     const done = flt_zero(op.completed_qty) + flt_zero(op.process_loss_qty);
     let pending;
-    if (idx === 0) pending = Math.max(0, req - done);
-    else {
+    if (idx === 0) {
+      pending = Math.max(0, req - done);
+    } else {
       const prev = (frm.doc.operations || [])[idx - 1] || {};
       const prev_completed = flt_zero(prev.completed_qty);
       pending = Math.max(0, prev_completed - done);
@@ -170,10 +183,10 @@ nts.provide("reporting_ops");
       fields: [
         {label: "Employee Number", fieldname: "empno", fieldtype: "Data", reqd: 1},
         {label: "Employee Name", fieldname: "empname", fieldtype: "Data", read_only: 1},
-        {label: "Produced", fieldname: "prod", fieldtype: "Float", default: pending},
+        {label: "Produced", fieldname: "prod", fieldtype: "Float", default: 0},
         {label: "Rejected", fieldname: "rej", fieldtype: "Float", default: 0},
-        {label: "Complete Operation", fieldname: "complete", fieldtype: "Check", description: "Check only when produced+rejected equals remaining pending"},
-        {label: "Force Complete JC (admin)", fieldname: "force", fieldtype: "Check", description: "Force-complete Job Card (bypass validations)."}
+        {label: "Complete Operation", fieldname: "complete", fieldtype: "Check", description: "Check only when this punch completes the entire operation"},
+        {label: "Force Complete JC", fieldname: "force", fieldtype: "Check", default: 1, description: "Force-complete Job Card when operation is completed"}
       ],
       primary_action_label: "Submit",
       primary_action: function(values) {
@@ -182,7 +195,10 @@ nts.provide("reporting_ops");
         const rej = flt_zero(values.rej);
         if (produced <= 0 && rej <= 0) { nts.msgprint("Enter produced or rejected quantity."); return; }
         if (produced + rej > pending + 1e-9) { nts.msgprint("Produced + Rejected exceeds pending."); return; }
-        if (values.complete && Math.abs((produced + rej) - pending) > 1e-6) { nts.msgprint("To mark complete, produced+rejected must equal remaining pending."); return; }
+        if (values.complete && Math.abs((produced + rej) - pending) > 1e-6) { 
+          nts.msgprint("To mark complete, produced+rejected must equal remaining pending (" + pending.toFixed(2) + ")."); 
+          return; 
+        }
 
         submit_report(frm, op, idx, values, pending, d);
       }
@@ -195,6 +211,18 @@ nts.provide("reporting_ops");
         const name = (r && r.message && r.message.employee_name) ? r.message.employee_name : "";
         d.set_value("empname", name);
       }).catch(() => d.set_value("empname", ""));
+    });
+
+    // Set default produced quantity to remaining if user wants to complete the operation
+    d.get_field("complete").$input.on("change", function() {
+      if (d.get_value("complete")) {
+        const current_prod = flt_zero(d.get_value("prod"));
+        const current_rej = flt_zero(d.get_value("rej"));
+        const total_current = current_prod + current_rej;
+        if (total_current < pending) {
+          d.set_value("prod", pending - current_rej);
+        }
+      }
     });
 
     d.show();
@@ -214,7 +242,7 @@ nts.provide("reporting_ops");
         process_loss: rej,
         posting_datetime: nts.datetime.now_datetime(),
         complete_operation: values.complete ? 1 : 0,
-        force_complete: values.force ? 1 : 1   // default force to 1 to match server heavy-handed approach
+        force_complete: values.force ? 1 : 0
       },
       freeze: true,
       freeze_message: "Reporting...",
@@ -223,7 +251,13 @@ nts.provide("reporting_ops");
           const resp = r && r.message ? r.message : (r || {});
           if (resp.ok) {
             dialog.hide();
-            nts.msgprint(resp.message || "Reported.");
+            let msg = resp.message || "Reported.";
+            if (resp.remaining > 1e-9) {
+              msg += " Operation remains open for more punches.";
+            } else if (resp.operation_completed) {
+              msg += " Operation completed!";
+            }
+            nts.msgprint(msg);
             // refresh authoritative doc values to avoid doubling / ghost rows
             frm.reload_doc();
           } else {
