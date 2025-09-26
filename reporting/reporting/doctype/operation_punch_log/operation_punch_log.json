@@ -5,23 +5,80 @@
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
-  "section_break_yl1z"
+  "parent_work_order",
+  "parent_op_idx",
+  "parent_op_name",
+  "employee_number",
+  "employee_name",
+  "produced_qty",
+  "rejected_qty",
+  "posting_datetime",
+  "processed",
+  "workstation"
  ],
-  "fields": [
-    {"fieldname": "parent_work_order", "label": "Work Order", "fieldtype": "Link", "options": "Work Order", "in_list_view": 1},
-    {"fieldname": "parent_op_idx", "label": "Operation Index", "fieldtype": "Int", "in_list_view": 1},
-    {"fieldname": "parent_op_name", "label": "Operation", "fieldtype": "Data", "in_list_view": 1},
-    {"fieldname": "employee_number", "label": "Employee Number", "fieldtype": "Data", "in_list_view": 1},
-    {"fieldname": "employee_name", "label": "Employee Name", "fieldtype": "Data", "in_list_view": 1},
-    {"fieldname": "produced_qty", "label": "Produced Qty", "fieldtype": "Float"},
-    {"fieldname": "rejected_qty", "label": "Rejected Qty", "fieldtype": "Float"},
-    {"fieldname": "posting_datetime", "label": "Posting Datetime", "fieldtype": "Datetime"},
-    {"fieldname": "processed", "label": "Processed", "fieldtype": "Check", "default": "0"}
-  ],
+ "fields": [
+  {
+   "fieldname": "parent_work_order",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Work Order",
+   "options": "Work Order"
+  },
+  {
+   "fieldname": "parent_op_idx",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Operation Index"
+  },
+  {
+   "fieldname": "parent_op_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Operation"
+  },
+  {
+   "fieldname": "employee_number",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Employee Number"
+  },
+  {
+   "fieldname": "employee_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Employee Name"
+  },
+  {
+   "fieldname": "produced_qty",
+   "fieldtype": "Float",
+   "label": "Produced Qty"
+  },
+  {
+   "fieldname": "rejected_qty",
+   "fieldtype": "Float",
+   "label": "Rejected Qty"
+  },
+  {
+   "fieldname": "posting_datetime",
+   "fieldtype": "Datetime",
+   "label": "Posting Datetime"
+  },
+  {
+   "default": "0",
+   "fieldname": "processed",
+   "fieldtype": "Check",
+   "label": "Processed"
+  },
+  {
+   "fieldname": "workstation",
+   "fieldtype": "Data",
+   "label": "Workstation"
+  }
+ ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2025-09-25 12:16:06.006825",
+ "modified": "2025-09-26 06:21:02.094888",
  "modified_by": "Administrator",
  "module": "Reporting",
  "name": "Operation Punch Log",

@@ -1,5 +1,5 @@
 // apps/reporting/reporting/public/js/work_order_ops_report.js
-// Fixed UI for proper partial punching support
+// Final clean UI for operators - no confusing checkboxes, smart auto-fill
 nts.provide("reporting_ops");
 (function() {
   if (!document.getElementById("reporting-custom-css")) {
@@ -25,6 +25,7 @@ nts.provide("reporting_ops");
       .r-report-note{color:#666;font-size:0.95em;margin-top:8px}
       .r-operation-completed{background-color:#e8f5e8;}
       .r-operation-partial{background-color:#fff3cd;}
+      .r-qty-hint{color:#28a745;font-size:0.9em;font-style:italic}
     `;
     document.head.appendChild(s);
   }
@@ -59,14 +60,13 @@ nts.provide("reporting_ops");
     const ops = frm.doc.operations || [];
     const started = !!frm.doc.material_transferred_for_manufacturing;
 
-    // Find first operation with remaining quantity (not necessarily the first non-reported one)
+    // Find first operation with remaining quantity
     let first_pending = null;
     for (let i = 0; i < ops.length; i++) {
       const o = ops[i];
       const req = required(o, frm.doc);
       const done = flt_zero(o.completed_qty) + flt_zero(o.process_loss_qty);
       
-      // Check if this operation has remaining quantity
       let pending;
       if (i === 0) {
         pending = Math.max(0, req - done);
@@ -116,10 +116,43 @@ nts.provide("reporting_ops");
       h += `<td class="r-col-com">${o.completed_qty || 0}</td>`;
       h += `<td class="r-col-rej">${o.process_loss_qty || 0}</td>`;
       h += `<td class="r-col-ws">${escapeHtml(o.workstation || "")}</td>`;
-      const rep_summary = o.op_reported_by_employee_name || "";
-      const rep_display = rep_summary.length > 28 ? escapeHtml(rep_summary.substring(0, 25) + "...") : escapeHtml(rep_summary || "—");
-      h += `<td class="r-reporter-cell">${rep_display}</td>`;
-      h += `<td class="r-col-date">${escapeHtml(o.op_reported_dt || "—")}</td>`;
+      
+      // Show reporter info for completed operations or from latest punch
+      let reporter_display = "—";
+      let reported_time = "—";
+      
+      // Check if operation has reporter info (these fields may not exist in all systems)
+      if (o.op_reported_by_employee_name && o.op_reported_dt) {
+        // Use operation level reporter info (for completed operations)
+        const rep_name = o.op_reported_by_employee_name;
+        reporter_display = rep_name.length > 28 ? escapeHtml(rep_name.substring(0, 25) + "...") : escapeHtml(rep_name);
+        try {
+          const dt = new Date(o.op_reported_dt);
+          reported_time = dt.toLocaleDateString() + " " + dt.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        } catch(e) {
+          reported_time = escapeHtml(o.op_reported_dt);
+        }
+      } else if (punches && punches.length > 0) {
+        // Use latest punch info
+        const latest_punch = punches[punches.length - 1];
+        if (latest_punch) {
+          const name_only = (latest_punch.employee_name && latest_punch.employee_name.trim()) ? 
+                           latest_punch.employee_name.trim() : (latest_punch.employee_number || "");
+          reporter_display = name_only.length > 28 ? escapeHtml(name_only.substring(0, 25) + "...") : escapeHtml(name_only || "—");
+          
+          if (latest_punch.posting_datetime) {
+            try {
+              const dt = new Date(latest_punch.posting_datetime);
+              reported_time = dt.toLocaleDateString() + " " + dt.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            } catch(e) {
+              reported_time = escapeHtml(latest_punch.posting_datetime || "—");
+            }
+          }
+        }
+      }
+      
+      h += `<td class="r-reporter-cell">${reporter_display}</td>`;
+      h += `<td class="r-col-date">${reported_time}</td>`;
       h += `<td class="r-col-date">${show_btn?`<button class="r-report-btn" data-idx="${idx}">Report (${pending.toFixed(1)} left)</button>`:"—"}</td>`;
       h += `</tr>`;
 
@@ -127,13 +160,25 @@ nts.provide("reporting_ops");
         punches.forEach(function(p) {
           const name_only = (p.employee_name && p.employee_name.trim()) ? p.employee_name.trim() : (p.employee_number || "");
           const display_name = name_only.length > 28 ? name_only.substring(0, 25) + "..." : name_only;
+          
+          // Format datetime for display
+          let display_datetime = "—";
+          if (p.posting_datetime) {
+            try {
+              const dt = new Date(p.posting_datetime);
+              display_datetime = dt.toLocaleDateString() + " " + dt.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            } catch(e) {
+              display_datetime = p.posting_datetime;
+            }
+          }
+          
           h += `<tr class="r-punch-row">`;
           h += `<td class="r-col-com">${p.produced_qty || 0}</td>`;
           h += `<td class="r-col-rej">${p.rejected_qty || 0}</td>`;
-          h += `<td class="r-col-ws r-empty-cell"></td>`;
+          h += `<td class="r-col-ws r-empty-cell">—</td>`; // No workstation field in your doctype
           h += `<td class="r-reporter-cell">${escapeHtml(display_name || "—")}</td>`;
-          h += `<td class="r-col-date">${escapeHtml(p.posting_datetime || "")}</td>`;
-          h += `<td class="r-col-date">—</td>`;
+          h += `<td class="r-col-date">${escapeHtml(display_datetime)}</td>`;
+          h += `<td class="r-col-date">Punch #${punches.indexOf(p) + 1}</td>`;
           h += `</tr>`;
         });
       } else {
@@ -149,7 +194,13 @@ nts.provide("reporting_ops");
     });
 
     h += `</tbody></table>`;
-    h += `<div class="r-report-note">Click Report for operations with remaining quantities. Partial punching supported - operation stays open until explicitly completed. Green rows are completed operations, yellow rows have partial progress.</div>`;
+    h += `<div class="r-report-note">
+      <strong>Instructions:</strong><br>
+      • Green rows = completed operations, Yellow rows = partial progress<br>
+      • Produced field auto-fills with remaining quantity (adjust as needed)<br>
+      • System automatically completes operation and Job Card when all quantities are reported<br>
+      • All punches are logged for audit trail
+    </div>`;
 
     frm.fields_dict[HOST_FIELD].html(h);
 
@@ -179,14 +230,18 @@ nts.provide("reporting_ops");
     }
 
     const d = new nts.ui.Dialog({
-      title: "Report " + (op.operation || ""),
+      title: "Report " + (op.operation || "") + " (Remaining: " + pending.toFixed(2) + ")",
       fields: [
         {label: "Employee Number", fieldname: "empno", fieldtype: "Data", reqd: 1},
         {label: "Employee Name", fieldname: "empname", fieldtype: "Data", read_only: 1},
-        {label: "Produced", fieldname: "prod", fieldtype: "Float", default: 0},
-        {label: "Rejected", fieldname: "rej", fieldtype: "Float", default: 0},
-        {label: "Complete Operation", fieldname: "complete", fieldtype: "Check", description: "Check only when this punch completes the entire operation"},
-        {label: "Force Complete JC", fieldname: "force", fieldtype: "Check", default: 1, description: "Force-complete Job Card when operation is completed"}
+        {
+          label: "Produced", 
+          fieldname: "prod", 
+          fieldtype: "Float", 
+          default: pending,
+          description: `<span class="r-qty-hint">Auto-filled with remaining qty (${pending.toFixed(2)}). Change for partial reporting.</span>`
+        },
+        {label: "Rejected", fieldname: "rej", fieldtype: "Float", default: 0}
       ],
       primary_action_label: "Submit",
       primary_action: function(values) {
@@ -194,9 +249,8 @@ nts.provide("reporting_ops");
         const produced = flt_zero(values.prod);
         const rej = flt_zero(values.rej);
         if (produced <= 0 && rej <= 0) { nts.msgprint("Enter produced or rejected quantity."); return; }
-        if (produced + rej > pending + 1e-9) { nts.msgprint("Produced + Rejected exceeds pending."); return; }
-        if (values.complete && Math.abs((produced + rej) - pending) > 1e-6) { 
-          nts.msgprint("To mark complete, produced+rejected must equal remaining pending (" + pending.toFixed(2) + ")."); 
+        if (produced + rej > pending + 1e-9) { 
+          nts.msgprint(`Produced + Rejected (${(produced + rej).toFixed(2)}) exceeds pending (${pending.toFixed(2)}).`); 
           return; 
         }
 
@@ -213,24 +267,16 @@ nts.provide("reporting_ops");
       }).catch(() => d.set_value("empname", ""));
     });
 
-    // Set default produced quantity to remaining if user wants to complete the operation
-    d.get_field("complete").$input.on("change", function() {
-      if (d.get_value("complete")) {
-        const current_prod = flt_zero(d.get_value("prod"));
-        const current_rej = flt_zero(d.get_value("rej"));
-        const total_current = current_prod + current_rej;
-        if (total_current < pending) {
-          d.set_value("prod", pending - current_rej);
-        }
-      }
-    });
-
     d.show();
   }
 
   function submit_report(frm, op, idx, values, pending, dialog) {
     const produced = flt_zero(values.prod);
     const rej = flt_zero(values.rej);
+    
+    // Auto-detect if this will complete the operation
+    const will_complete = Math.abs((produced + rej) - pending) <= 1e-6;
+    
     nts.call({
       method: "reporting.reporting.api.work_order_ops.report_operation",
       args: {
@@ -240,9 +286,7 @@ nts.provide("reporting_ops");
         employee_number: values.empno,
         produced_qty: produced,
         process_loss: rej,
-        posting_datetime: nts.datetime.now_datetime(),
-        complete_operation: values.complete ? 1 : 0,
-        force_complete: values.force ? 1 : 0
+        posting_datetime: nts.datetime.now_datetime()
       },
       freeze: true,
       freeze_message: "Reporting...",
@@ -251,47 +295,83 @@ nts.provide("reporting_ops");
           const resp = r && r.message ? r.message : (r || {});
           if (resp.ok) {
             dialog.hide();
-            let msg = resp.message || "Reported.";
-            if (resp.remaining > 1e-9) {
-              msg += " Operation remains open for more punches.";
-            } else if (resp.operation_completed) {
-              msg += " Operation completed!";
+            let msg = resp.message || "Reported successfully.";
+            
+            if (resp.operation_completed) {
+              msg += "<br><strong>✓ Operation completed and Job Card submitted!</strong>";
+            } else if (resp.remaining > 1e-9) {
+              msg += `<br>Operation remains open. You can report the remaining ${resp.remaining.toFixed(2)} qty in next punch.`;
             }
-            nts.msgprint(msg);
-            // refresh authoritative doc values to avoid doubling / ghost rows
+            
+            nts.msgprint({
+              title: will_complete ? "Operation Completed!" : "Partial Punch Recorded",
+              message: msg,
+              indicator: will_complete ? "green" : "blue"
+            });
+            
+            // Refresh to show updated data
             frm.reload_doc();
           } else {
             dialog.hide();
             const err = resp.error_message || "Reporting failed.";
             const tb = resp.traceback;
             if (tb) {
-              const d = new nts.ui.Dialog({
+              const error_dialog = new nts.ui.Dialog({
                 title: "Server Error",
-                fields: [{label:"Error", fieldname:"err", fieldtype:"Small Text", read_only:1},{label:"Trace", fieldname:"tb", fieldtype:"Code", read_only:1}],
+                fields: [
+                  {label:"Error", fieldname:"err", fieldtype:"Small Text", read_only:1},
+                  {label:"Details", fieldname:"tb", fieldtype:"Code", read_only:1}
+                ],
                 primary_action_label: "Close",
-                primary_action: function(){ d.hide(); }
+                primary_action: function(){ error_dialog.hide(); }
               });
-              d.set_value("err", err);
-              d.set_value("tb", tb);
-              d.show();
+              error_dialog.set_value("err", err);
+              error_dialog.set_value("tb", tb);
+              error_dialog.show();
             } else {
-              nts.msgprint(err);
+              nts.msgprint({
+                title: "Error",
+                message: err,
+                indicator: "red"
+              });
             }
             frm.reload_doc();
           }
         } catch (e) {
           dialog.hide();
-          nts.msgprint("Reported (UI update failed).");
+          nts.msgprint({
+            title: "Success",
+            message: "Punch recorded successfully (UI update issue).",
+            indicator: "green"
+          });
           frm.reload_doc();
         }
       },
       error: function(err) {
         dialog.hide();
         try {
-          const srv = err && err.responseJSON && err.responseJSON._server_messages ? JSON.parse(err.responseJSON._server_messages)[0] : (err && err.responseJSON && err.responseJSON.message ? err.responseJSON.message : null);
-          if (srv) { nts.msgprint(String(srv)); } else { nts.msgprint("Failed to report. Contact admin."); }
+          const srv = err && err.responseJSON && err.responseJSON._server_messages ? 
+                      JSON.parse(err.responseJSON._server_messages)[0] : 
+                      (err && err.responseJSON && err.responseJSON.message ? err.responseJSON.message : null);
+          if (srv) { 
+            nts.msgprint({
+              title: "Server Error",
+              message: String(srv),
+              indicator: "red"
+            });
+          } else { 
+            nts.msgprint({
+              title: "Error",
+              message: "Failed to report. Please contact administrator.",
+              indicator: "red"
+            });
+          }
         } catch (e) {
-          nts.msgprint("Failed to report. Contact admin.");
+          nts.msgprint({
+            title: "Error", 
+            message: "Failed to report. Please contact administrator.",
+            indicator: "red"
+          });
         }
         frm.reload_doc();
       }
