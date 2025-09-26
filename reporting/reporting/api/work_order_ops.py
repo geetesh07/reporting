@@ -1,9 +1,8 @@
 # apps/reporting/reporting/reporting/api/work_order_ops.py
-# 2025-09 - Final clean version for partial punching
-# - No Job Card Time Log entries (causes reporting conflicts)
-# - Auto-detects last punch and submits Job Card automatically
-# - Clean Operation Punch Log for audit trail
-# - Proper Work Order cancellation support
+# 2025-09 - Fixed quantity flow and rejection reason handling
+# - Proper rejection carryover between operations following ERPNext practices
+# - Rejection reason capture for actual rejections
+# - Fixed missing fields in Operation Punch Log
 import nts
 from nts import _
 from nts.utils import flt, get_datetime, now_datetime
@@ -14,6 +13,16 @@ from nts import log_error
 def _make_name(prefix="OPLOG"):
     import uuid
     return "{}-{}".format(prefix, uuid.uuid4().hex[:12])
+
+def compute_minutes(from_time, to_time):
+    """Calculate minutes between two datetime objects"""
+    try:
+        fd = get_datetime(from_time)
+        td = get_datetime(to_time)
+        diff = (td - fd).total_seconds()
+        return max(1, int(round(diff / 60.0)))  # Default to 1 minute minimum
+    except Exception:
+        return 1  # Default to 1 minute for time logs
 
 def _table_exists(table_name: str) -> bool:
     try:
@@ -40,14 +49,14 @@ def _get_table_columns(table_name: str):
 
 def _insert_operation_punch_log(parent_work_order, parent_op_idx, parent_op_name,
                                 employee_number, employee_name, produced_qty, rejected_qty, 
-                                posting_datetime, processed_flag):
-    """Insert punch log matching exact doctype structure"""
+                                posting_datetime, processed_flag, rejection_reason=None):
+    """Insert punch log with proper ERPNext fields"""
     table = "tabOperation Punch Log"
     if not _table_exists(table):
         log_error("tabOperation Punch Log does not exist. Skipping punch log insert.", "punch_log_missing")
         return None
     
-    # Match your exact doctype fields
+    # Standard ERPNext fields + your custom fields
     insert_data = {
         "name": _make_name("OPLOG"),
         "parent_work_order": parent_work_order,
@@ -59,15 +68,23 @@ def _insert_operation_punch_log(parent_work_order, parent_op_idx, parent_op_name
         "rejected_qty": rejected_qty,
         "posting_datetime": posting_datetime,
         "processed": processed_flag,
+        "rejection_reason": rejection_reason,
         "creation": now_datetime(),
         "modified": now_datetime(),
-        "owner": nts.session.user
+        "modified_by": nts.session.user,
+        "owner": nts.session.user,
+        "docstatus": 0,
+        "idx": 1
     }
+
+    # Get existing columns to filter data
+    cols = _get_table_columns(table)
+    filtered_data = {k: v for k, v in insert_data.items() if k in cols}
 
     try:
         # Build dynamic insert query
-        columns = list(insert_data.keys())
-        values = list(insert_data.values())
+        columns = list(filtered_data.keys())
+        values = list(filtered_data.values())
         placeholders = ["%s" if col not in ("creation", "modified") else "NOW()" for col in columns]
         values = [v for i, v in enumerate(values) if columns[i] not in ("creation", "modified")]
         
@@ -77,7 +94,7 @@ def _insert_operation_punch_log(parent_work_order, parent_op_idx, parent_op_name
         
         nts.db.sql(query, tuple(values))
         nts.db.commit()
-        return insert_data.get("name")
+        return filtered_data.get("name")
     except Exception:
         log_error(traceback.format_exc(), "punch_log_insert_error")
         return None
@@ -139,8 +156,8 @@ def get_punch_logs(work_order):
         # Build SELECT query with only existing columns
         select_cols = ["parent_op_idx", "employee_number", "employee_name", "produced_qty", "rejected_qty", 
                       "posting_datetime", "name", "processed"]
-        if "workstation" in cols:
-            select_cols.append("workstation")
+        if "rejection_reason" in cols:
+            select_cols.append("rejection_reason")
         
         col_fragment = ", ".join(select_cols)
         
@@ -161,13 +178,12 @@ def get_punch_logs(work_order):
         return {}
 
 @nts.whitelist()
-def report_operation(work_order, op_index, operation_name, employee_number, produced_qty, process_loss=0, posting_datetime=None):
+def report_operation(work_order, op_index, operation_name, employee_number, produced_qty, process_loss=0, posting_datetime=None, rejection_reason=None):
     """
-    Final clean implementation:
-    - No Job Card Time Log entries (causes conflicts)
-    - Auto-detects completion and handles Job Card submission
-    - Clean Operation Punch Log for audit
-    - Proper error handling for Work Order cancellation
+    Fixed implementation with proper quantity flow and rejection reason:
+    - Follows ERPNext quantity flow practices
+    - Captures rejection reason only when there's actual rejection
+    - Proper carryover of rejections to next operations
     """
     produced_qty = flt(produced_qty or 0)
     process_loss = flt(process_loss or 0)
@@ -202,7 +218,7 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
 
     op_row = operations[idx]
 
-    # Calculate required quantity
+    # Calculate required quantity for this operation
     def get_required_qty(o):
         rq = flt(o.get("operation_qty") or o.get("for_quantity") or o.get("qty") or o.get("required_qty") or 0)
         if rq <= 0:
@@ -211,10 +227,12 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
 
     required_qty = get_required_qty(op_row)
 
-    # Calculate available input
+    # Calculate available input following ERPNext logic
     if idx == 0:
+        # First operation gets full quantity to manufacture
         available_input = required_qty
     else:
+        # Subsequent operations get completed qty from previous operation
         prev_op = operations[idx - 1]
         prev_completed = flt(prev_op.get("completed_qty") or 0)
         # Get fresh data from DB
@@ -225,7 +243,7 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
                     prev_completed = flt(vals.get("completed_qty") or 0)
         except Exception:
             pass
-        available_input = min(required_qty, prev_completed)
+        available_input = prev_completed
 
     # Get current completed quantities
     current_completed = 0.0
@@ -267,6 +285,10 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     if (produced_qty + process_loss) > pending_qty + 1e-9:
         nts.throw(_("Produced + Rejected ({0}) exceeds pending ({1}).").format(
             produced_qty + process_loss, pending_qty))
+
+    # Validate rejection reason if there's actual rejection in this punch
+    if process_loss > 0 and not rejection_reason:
+        nts.throw(_("Rejection reason is required when rejecting quantities."))
 
     # Determine if this completes the operation
     will_complete_operation = abs((produced_qty + process_loss) - pending_qty) <= 1e-6
@@ -359,7 +381,7 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
     except Exception:
         log_error(traceback.format_exc(), "update_job_card_total_failed")
 
-    # Insert Operation Punch Log for audit trail (using exact doctype structure)
+    # Insert Operation Punch Log for audit trail
     punch_name = _insert_operation_punch_log(
         parent_work_order=wo.name,
         parent_op_idx=idx,
@@ -369,7 +391,8 @@ def report_operation(work_order, op_index, operation_name, employee_number, prod
         produced_qty=produced_qty,
         rejected_qty=process_loss,
         posting_datetime=posting_dt,
-        processed_flag=0
+        processed_flag=0,
+        rejection_reason=rejection_reason if process_loss > 0 else None
     )
 
     # Update Work Order Operation totals

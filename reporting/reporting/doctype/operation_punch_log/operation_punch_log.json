@@ -14,7 +14,8 @@
   "rejected_qty",
   "posting_datetime",
   "processed",
-  "workstation"
+  "workstation",
+  "rejection_reason"
  ],
  "fields": [
   {
@@ -73,12 +74,17 @@
    "fieldname": "workstation",
    "fieldtype": "Data",
    "label": "Workstation"
+  },
+  {
+   "fieldname": "rejection_reason",
+   "fieldtype": "Data",
+   "label": "Rejection Reason"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2025-09-26 06:21:02.094888",
+ "modified": "2025-09-26 09:58:12.861320",
  "modified_by": "Administrator",
  "module": "Reporting",
  "name": "Operation Punch Log",
